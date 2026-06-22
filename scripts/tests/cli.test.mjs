@@ -9,6 +9,8 @@ import process from "node:process";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 
+import { DEFAULT_BASE_URL, resolveInvocation } from "../lib/image-client.mjs";
+
 const execFileAsync = promisify(execFile);
 const scriptPath = path.resolve("scripts/niucodes-image-gen.mjs");
 const repoRoot = path.resolve(".");
@@ -38,6 +40,21 @@ async function createTempDir() {
 async function writePng(filePath) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, Buffer.from(fixturePngBase64, "base64"));
+}
+
+async function createCodexHome(tempRoot, { authJson, configToml } = {}) {
+  const codexHome = path.join(tempRoot, ".codex");
+  await mkdir(codexHome, { recursive: true });
+
+  if (authJson !== undefined) {
+    await writeFile(path.join(codexHome, "auth.json"), JSON.stringify(authJson, null, 2));
+  }
+
+  if (configToml !== undefined) {
+    await writeFile(path.join(codexHome, "config.toml"), configToml);
+  }
+
+  return codexHome;
 }
 
 function parseMultipart(buffer, contentType) {
@@ -315,6 +332,102 @@ test("config file works and CLI overrides config values", async () => {
       assert.equal(result.request.quality, "medium");
       assert.equal(result.saved.length, 1);
       assert.match(result.saved[0].absolute_path, /image-outputs|outputs/i);
+    },
+  );
+});
+
+test("resolveInvocation defaults to niucodes base URL and prefers auth.json API key", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      OPENAI_API_KEY: "auth-json-key",
+    },
+    configToml: [
+      'model_provider = "niucodes"',
+      "",
+      "[model_providers.niucodes]",
+      'experimental_bearer_token = "provider-key"',
+    ].join("\n"),
+  });
+
+  const invocation = await resolveInvocation(
+    "generate",
+    {
+      prompt: "draw a lantern festival",
+      image: [],
+    },
+    {
+      cwd: repoRoot,
+      env: {
+        CODEX_HOME: codexHome,
+        USERPROFILE: tempDir,
+        HOME: tempDir,
+      },
+    },
+  );
+
+  assert.equal(invocation.apiKey, "auth-json-key");
+  assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
+});
+
+test("CLI falls back to active model provider experimental_bearer_token", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      OPENAI_API_KEY: null,
+    },
+    configToml: [
+      'model_provider = "niucodes"',
+      "",
+      "[model_providers.niucodes]",
+      'experimental_bearer_token = "provider-fallback-key"',
+    ].join("\n"),
+  });
+  const outputPath = path.join(tempDir, "provider-fallback.png");
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer provider-fallback-key$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a paper crane");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await execFileAsync(
+        process.execPath,
+        [
+          scriptPath,
+          "generate",
+          "--prompt",
+          "paint a paper crane",
+          "--output",
+          outputPath,
+        ],
+        {
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.base_url, `${baseURL}/v1`);
+      assert.equal(result.saved[0].absolute_path, outputPath);
     },
   );
 });

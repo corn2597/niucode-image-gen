@@ -4,6 +4,8 @@ import path from "node:path";
 
 import OpenAI, { toFile } from "openai";
 
+export const DEFAULT_BASE_URL = "https://niucodes.com/v1";
+
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return {};
@@ -25,7 +27,7 @@ function mergeDefinedObjects(...sources) {
   for (const source of sources) {
     const normalized = normalizeObjectKeys(source);
     for (const [key, value] of Object.entries(normalized)) {
-      if (value !== undefined) {
+      if (value !== undefined && value !== null && !(typeof value === "string" && value.trim() === "")) {
         merged[key] = value;
       }
     }
@@ -121,6 +123,123 @@ function readEnvironmentConfig(env) {
   });
 }
 
+function resolveCodexHome(env) {
+  if (env.CODEX_HOME) {
+    return env.CODEX_HOME;
+  }
+
+  if (env.USERPROFILE) {
+    return path.join(env.USERPROFILE, ".codex");
+  }
+
+  if (env.HOME) {
+    return path.join(env.HOME, ".codex");
+  }
+
+  return null;
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function extractAuthJsonApiKey(rawAuth) {
+  if (!rawAuth || typeof rawAuth !== "object") {
+    return undefined;
+  }
+
+  const candidateFields = [
+    "OPENAI_API_KEY",
+    "LUPOAPI_API_KEY",
+    "LUOAPI_API_KEY",
+    "API_KEY",
+    "apiKey",
+    "api_key",
+  ];
+
+  for (const fieldName of candidateFields) {
+    const candidate = rawAuth[fieldName];
+    if (typeof candidate === "string" && candidate.trim() !== "") {
+      return candidate.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function extractProviderExperimentalBearerToken(rawToml) {
+  if (!rawToml) {
+    return undefined;
+  }
+
+  const providerMatch = rawToml.match(/^\s*model_provider\s*=\s*"([^"]+)"/m);
+  const providerName = providerMatch?.[1]?.trim();
+  if (!providerName) {
+    return undefined;
+  }
+
+  const lines = rawToml.split(/\r?\n/);
+  const targetSectionHeader = `[model_providers.${providerName}]`;
+  let insideTargetSection = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      insideTargetSection = trimmed === targetSectionHeader;
+      continue;
+    }
+
+    if (!insideTargetSection) {
+      continue;
+    }
+
+    const tokenMatch = line.match(/^\s*experimental_bearer_token\s*=\s*"([^"]+)"/);
+    if (tokenMatch?.[1]?.trim()) {
+      return tokenMatch[1].trim();
+    }
+  }
+
+  return undefined;
+}
+
+async function readDiscoveredCredentials(env) {
+  const codexHome = resolveCodexHome(env);
+  if (!codexHome) {
+    return {};
+  }
+
+  const authJsonPath = path.join(codexHome, "auth.json");
+  const authJsonText = await readTextIfExists(authJsonPath);
+  if (authJsonText) {
+    const authJson = JSON.parse(authJsonText);
+    const authJsonApiKey = extractAuthJsonApiKey(authJson);
+    if (authJsonApiKey) {
+      return {
+        apiKey: authJsonApiKey,
+      };
+    }
+  }
+
+  const configTomlPath = path.join(codexHome, "config.toml");
+  const configTomlText = await readTextIfExists(configTomlPath);
+  const experimentalBearerToken = extractProviderExperimentalBearerToken(configTomlText);
+  if (experimentalBearerToken) {
+    return {
+      apiKey: experimentalBearerToken,
+    };
+  }
+
+  return {};
+}
+
 async function assertLocalFile(filePath) {
   const resolved = path.resolve(filePath);
   let stream;
@@ -197,14 +316,15 @@ function applySharedPayload(invocation) {
 export async function resolveInvocation(command, cliOptions, { cwd, env }) {
   const configFile = cliOptions.config ? await readConfigFile(cliOptions.config, cwd) : {};
   const envConfig = readEnvironmentConfig(env);
-  const merged = mergeDefinedObjects(configFile, envConfig, cliOptions);
+  const discoveredCredentials = await readDiscoveredCredentials(env);
+  const merged = mergeDefinedObjects(discoveredCredentials, configFile, envConfig, cliOptions);
 
   const images = parseStringArray(cliOptions.image.length > 0 ? cliOptions.image : merged.image);
   const invocation = {
     command,
     cwd,
     apiKey: parseString(merged.apiKey, undefined),
-    baseURL: trimTrailingSlash(parseString(merged.baseURL, undefined)),
+    baseURL: trimTrailingSlash(parseString(merged.baseURL, DEFAULT_BASE_URL)),
     model: parseString(merged.model, "gpt-image-2"),
     prompt: parseString(merged.prompt, undefined),
     output: parseString(merged.output, undefined),
@@ -251,7 +371,9 @@ export async function resolveInvocation(command, cliOptions, { cwd, env }) {
   };
 
   if (!invocation.apiKey) {
-    throw new Error("Missing API key. Pass --api-key or set OPENAI_API_KEY.");
+    throw new Error(
+      "Missing API key. Pass --api-key, set OPENAI_API_KEY, add a key to ~/.codex/auth.json, or configure experimental_bearer_token for the active model provider.",
+    );
   }
   if (!invocation.prompt) {
     throw new Error("Missing prompt. Pass --prompt.");

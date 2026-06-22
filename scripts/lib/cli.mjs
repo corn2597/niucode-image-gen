@@ -1,7 +1,12 @@
 import { stat } from "node:fs/promises";
 import process from "node:process";
 
-import { createImageRequest, formatOpenAIError, resolveInvocation } from "./image-client.mjs";
+import {
+  DEFAULT_BASE_URL,
+  createImageRequest,
+  formatOpenAIError,
+  resolveInvocation,
+} from "./image-client.mjs";
 import {
   buildRenderables,
   resolveOutputTargets,
@@ -12,8 +17,8 @@ import {
 const HELP_TEXT = `niucodes-image-gen
 
 Usage:
-  node <skill-dir>/scripts/niucodes-image-gen.mjs generate --prompt "..." --api-key "<key>" [options]
-  node <skill-dir>/scripts/niucodes-image-gen.mjs edit --image "<path>" --prompt "..." --api-key "<key>" [options]
+  node <skill-dir>/scripts/niucodes-image-gen.mjs generate --prompt "..." [--api-key "<key>"] [options]
+  node <skill-dir>/scripts/niucodes-image-gen.mjs edit --image "<path>" --prompt "..." [--api-key "<key>"] [options]
 
 Commands:
   generate    Call /v1/images/generations through the official OpenAI Node SDK.
@@ -21,8 +26,9 @@ Commands:
 
 Common options:
   --config <path>               Load JSON config. CLI flags override config values.
-  --api-key <key>               API key. Falls back to OPENAI_API_KEY.
-  --base-url <url>              SDK baseURL. Falls back to OPENAI_BASE_URL.
+  --api-key <key>               API key. Falls back to OPENAI_API_KEY, ~/.codex/auth.json,
+                                or the active model provider experimental_bearer_token.
+  --base-url <url>              SDK baseURL. Defaults to ${DEFAULT_BASE_URL}.
   --model <model>               Defaults to gpt-image-2 or OPENAI_IMAGE_MODEL.
   --output <file-or-dir>        Output file or directory. Defaults to ./image-outputs/.
   --output-format <fmt>         png | jpeg | webp
@@ -134,7 +140,7 @@ function buildResponse(invocation, targets, savedItems, apiResponse) {
   return {
     command: invocation.command,
     model: invocation.model,
-    base_url: invocation.baseURL ?? "https://api.openai.com/v1",
+    base_url: invocation.baseURL ?? DEFAULT_BASE_URL,
     request: {
       prompt: invocation.prompt,
       image_count: invocation.images.length,
