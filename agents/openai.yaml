@@ -1,0 +1,4 @@
+interface:
+  display_name: "niucodes image gen"
+  short_description: "Cross-platform OpenAI image gen/edit helper"
+  default_prompt: "Use $niucodes-image-gen to generate or edit images through the OpenAI SDK with configurable model, base URL, API key, and renderable local outputs."

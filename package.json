@@ -1,0 +1,19 @@
+{
+  "name": "niucodes-image-gen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform Codex skill project for OpenAI image generation and editing.",
+  "type": "module",
+  "bin": {
+    "niucodes-image-gen": "./scripts/niucodes-image-gen.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test scripts/tests/*.test.mjs"
+  },
+  "dependencies": {
+    "openai": "^6.44.0"
+  }
+}

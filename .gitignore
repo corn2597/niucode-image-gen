@@ -1,0 +1,6 @@
+node_modules/
+image-outputs/
+scripts/tests/tmp/
+tmp/
+*.local.json
+.DS_Store
