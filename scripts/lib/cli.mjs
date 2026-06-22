@@ -42,6 +42,7 @@ Common options:
   --n <count>                   Number of images to save. Default: 1
   --overwrite                   Overwrite the first output path if it already exists.
   --timeout-ms <ms>             SDK timeout in milliseconds. Default: 180000
+  --verbose-response            Include expanded request/response metadata in the JSON output.
 
 Edit-only options:
   --image <path>                Repeat to upload multiple local reference images.
@@ -49,8 +50,8 @@ Edit-only options:
   --input-fidelity <value>      low | high. Omit for gpt-image-2.
 
 Display rule:
-  The script prints JSON with saved[*].markdown. Reuse those markdown strings in the final answer
-  so Codex, VS Code surfaces, and similar clients can render the saved local image files.
+  The script prints compact JSON by default. Reuse saved[*].markdown in the final answer so Codex,
+  VS Code surfaces, and similar clients can render the saved local image files.
 `;
 
 function parseArgumentValue(rawValue) {
@@ -138,36 +139,66 @@ async function fileExists(filePath) {
   }
 }
 
-function buildResponse(invocation, targets, savedItems, apiResponse) {
+function buildResponse(invocation, targets, savedItems, apiResponse, verboseResponse) {
   const renderables = buildRenderables(savedItems, invocation.command);
-  return {
+  const payload = {
+    ok: true,
     command: invocation.command,
     model: invocation.model,
     base_url: invocation.baseURL ?? DEFAULT_BASE_URL,
-    request: {
+    size: invocation.size,
+    quality: invocation.quality,
+    output_format: invocation.outputFormat,
+    saved: renderables,
+    request_id: apiResponse?._request_id ?? null,
+    revised_prompt: apiResponse?.data?.[0]?.revised_prompt ?? null,
+  };
+
+  if (verboseResponse) {
+    payload.request = {
       prompt: invocation.prompt,
       image_count: invocation.images.length,
       mask: invocation.mask ?? null,
-      size: invocation.size,
-      quality: invocation.quality,
       background: invocation.background,
       moderation: invocation.moderation,
-      output_format: invocation.outputFormat,
       output_compression: invocation.outputCompression ?? null,
       input_fidelity: invocation.inputFidelity ?? null,
       n: invocation.n,
       output: invocation.output ?? null,
       overwrite: invocation.overwrite,
-    },
-    saved: renderables,
-    response: {
-      request_id: apiResponse?._request_id ?? null,
-      revised_prompt: apiResponse?.data?.[0]?.revised_prompt ?? null,
+    };
+    payload.response = {
       raw_item_count: Array.isArray(apiResponse?.data) ? apiResponse.data.length : targets.length,
-    },
-    render_hint:
-      "Paste each saved[*].markdown string into the final answer to render the saved images in Codex or compatible VS Code surfaces.",
-  };
+    };
+    payload.render_hint =
+      "Paste each saved[*].markdown string into the final answer to render the saved images in Codex or compatible VS Code surfaces.";
+  }
+
+  return payload;
+}
+
+function parseBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  throw new Error(`Invalid boolean value for --verbose-response: ${value}`);
+}
+
+function resolveVerboseResponse(rawValue) {
+  return parseBooleanFlag(rawValue, false);
 }
 
 export async function runCli(argv, { cwd = process.cwd(), env = process.env } = {}) {
@@ -181,6 +212,7 @@ export async function runCli(argv, { cwd = process.cwd(), env = process.env } = 
     throw new Error(`Unsupported command: ${parsed.command}`);
   }
 
+  const verboseResponse = resolveVerboseResponse(parsed.options.verboseResponse);
   const invocation = await resolveInvocation(parsed.command, parsed.options, { cwd, env });
 
   try {
@@ -196,7 +228,13 @@ export async function runCli(argv, { cwd = process.cwd(), env = process.env } = 
     });
 
     const savedItems = await saveImageItems(apiResponse, outputTargets, invocation.timeoutMs);
-    const payload = buildResponse(invocation, outputTargets, savedItems, apiResponse);
+    const payload = buildResponse(
+      invocation,
+      outputTargets,
+      savedItems,
+      apiResponse,
+      verboseResponse,
+    );
 
     process.stdout.write(`${stableStringify(payload)}\n`);
     return 0;

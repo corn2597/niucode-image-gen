@@ -134,8 +134,9 @@ test("skill structure files exist", async () => {
   const openaiYaml = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
 
   assert.match(skillContent, /^---\nname: niucodes-image-gen\n/);
-  assert.match(skillContent, /Generate or edit images through the official OpenAI Node SDK/);
+  assert.match(skillContent, /Thin API-forwarding wrapper/);
   assert.match(openaiYaml, /display_name: "niucodes image gen"/);
+  assert.match(openaiYaml, /thin API wrapper/i);
 });
 
 test("generate command sends JSON request and saves renderable output", async () => {
@@ -182,7 +183,10 @@ test("generate command sends JSON request and saves renderable output", async ()
 
       assert.equal(stderr, "");
       const result = JSON.parse(stdout);
+      assert.equal(result.ok, true);
       assert.equal(result.command, "generate");
+      assert.equal(result.size, DEFAULT_GENERATE_SIZE);
+      assert.equal("request" in result, false);
       assert.equal(result.saved.length, 1);
       assert.equal(result.saved[0].absolute_path, outputPath);
       assert.match(result.saved[0].markdown, /^!\[generate-1\]\(\/[A-Z]:\//i);
@@ -270,10 +274,12 @@ test("edit command uses multipart uploads for multiple images and mask", async (
         "low",
         "--size",
         "1024x1024",
+        "--verbose-response",
       ]);
 
       assert.equal(stderr, "");
       const result = JSON.parse(stdout);
+      assert.equal(result.ok, true);
       assert.equal(result.command, "edit");
       assert.equal(result.request.image_count, 2);
       assert.equal(result.saved[0].absolute_path, outputPath);
@@ -335,7 +341,7 @@ test("config file works and CLI overrides config values", async () => {
 
       const result = JSON.parse(stdout);
       assert.equal(result.model, "gpt-image-2");
-      assert.equal(result.request.quality, "medium");
+      assert.equal(result.quality, "medium");
       assert.equal(result.saved.length, 1);
       assert.match(result.saved[0].absolute_path, /image-outputs|outputs/i);
     },
