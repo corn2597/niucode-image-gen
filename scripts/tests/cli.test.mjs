@@ -9,7 +9,12 @@ import process from "node:process";
 import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 
-import { DEFAULT_BASE_URL, resolveInvocation } from "../lib/image-client.mjs";
+import {
+  DEFAULT_BASE_URL,
+  DEFAULT_EDIT_SIZE,
+  DEFAULT_GENERATE_SIZE,
+  resolveInvocation,
+} from "../lib/image-client.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = path.resolve("scripts/niucodes-image-gen.mjs");
@@ -147,6 +152,7 @@ test("generate command sends JSON request and saves renderable output", async ()
       assert.equal(parsed.model, "gpt-image-2");
       assert.equal(parsed.prompt, "paint a tiny blue fox");
       assert.equal(parsed.output_format, "png");
+      assert.equal(parsed.size, DEFAULT_GENERATE_SIZE);
       res.statusCode = 200;
       res.setHeader("content-type", "application/json");
       res.end(
@@ -368,6 +374,34 @@ test("resolveInvocation defaults to niucodes base URL and prefers auth.json API 
 
   assert.equal(invocation.apiKey, "auth-json-key");
   assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
+  assert.equal(invocation.size, DEFAULT_GENERATE_SIZE);
+});
+
+test("resolveInvocation keeps edit size on auto by default", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      OPENAI_API_KEY: "edit-default-key",
+    },
+  });
+
+  const invocation = await resolveInvocation(
+    "edit",
+    {
+      prompt: "add a red scarf",
+      image: [path.join(repoRoot, "package.json")],
+    },
+    {
+      cwd: repoRoot,
+      env: {
+        CODEX_HOME: codexHome,
+        USERPROFILE: tempDir,
+        HOME: tempDir,
+      },
+    },
+  );
+
+  assert.equal(invocation.size, DEFAULT_EDIT_SIZE);
 });
 
 test("CLI falls back to active model provider experimental_bearer_token", async () => {

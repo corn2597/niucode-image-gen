@@ -5,6 +5,8 @@ import path from "node:path";
 import OpenAI, { toFile } from "openai";
 
 export const DEFAULT_BASE_URL = "https://niucodes.com/v1";
+export const DEFAULT_GENERATE_SIZE = "1024x1024";
+export const DEFAULT_EDIT_SIZE = "auto";
 
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -318,6 +320,7 @@ export async function resolveInvocation(command, cliOptions, { cwd, env }) {
   const envConfig = readEnvironmentConfig(env);
   const discoveredCredentials = await readDiscoveredCredentials(env);
   const merged = mergeDefinedObjects(discoveredCredentials, configFile, envConfig, cliOptions);
+  const defaultSize = command === "generate" ? DEFAULT_GENERATE_SIZE : DEFAULT_EDIT_SIZE;
 
   const images = parseStringArray(cliOptions.image.length > 0 ? cliOptions.image : merged.image);
   const invocation = {
@@ -339,7 +342,7 @@ export async function resolveInvocation(command, cliOptions, { cwd, env }) {
       "medium",
       "high",
     ]),
-    size: parseString(merged.size, "auto"),
+    size: parseString(merged.size, defaultSize),
     background: validateChoice(parseString(merged.background, "auto"), "background", [
       "auto",
       "opaque",

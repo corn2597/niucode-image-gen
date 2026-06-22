@@ -3,6 +3,8 @@ import process from "node:process";
 
 import {
   DEFAULT_BASE_URL,
+  DEFAULT_EDIT_SIZE,
+  DEFAULT_GENERATE_SIZE,
   createImageRequest,
   formatOpenAIError,
   resolveInvocation,
@@ -33,7 +35,8 @@ Common options:
   --output <file-or-dir>        Output file or directory. Defaults to ./image-outputs/.
   --output-format <fmt>         png | jpeg | webp
   --quality <value>             auto | low | medium | high
-  --size <value>                auto or a supported size such as 1024x1024
+  --size <value>                Supported size. Defaults to ${DEFAULT_GENERATE_SIZE} for generate
+                                and ${DEFAULT_EDIT_SIZE} for edit.
   --background <value>          auto | opaque | transparent
   --moderation <value>          auto | low
   --n <count>                   Number of images to save. Default: 1

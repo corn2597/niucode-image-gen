@@ -46,6 +46,8 @@ Default behavior:
 
 - `baseURL` defaults to `https://niucodes.com/v1`
 - `apiKey` falls back to `OPENAI_API_KEY`, then `~/.codex/auth.json`, then the active model provider's `experimental_bearer_token`
+- `generate` defaults `size` to `1024x1024`, which is the smallest standard GPT image size currently documented by OpenAI
+- `edit` keeps `size=auto` by default so reference-image edits preserve a more natural output fit unless the caller overrides it
 
 Do not print or echo the API key after loading configuration.
 
@@ -93,6 +95,7 @@ node "$SkillDir/scripts/niucodes-image-gen.mjs" edit `
 - If the user does not provide an output location, let the script save under `./image-outputs/`.
 - If the user does not provide `--base-url`, use `https://niucodes.com/v1`.
 - If the user does not provide `--api-key`, rely on local Codex auth discovery before asking for one manually.
+- If the user does not provide `--size` for prompt-only generation, use `1024x1024` by default to favor the smallest currently documented GPT image size and reduce latency.
 - The edit API requires the source image and mask to share the same format and size.
 - For `gpt-image-2`, omit `input_fidelity` and never set `background=transparent`.
 - Prefer `png` unless the user explicitly wants faster or smaller `jpeg` / `webp` output.
