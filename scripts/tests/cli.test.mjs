@@ -133,7 +133,7 @@ test("skill structure files exist", async () => {
   const skillContent = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
   const openaiYaml = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
 
-  assert.match(skillContent, /^---\nname: niucodes-image-gen\n/);
+  assert.match(skillContent, /^---\r?\nname: niucodes-image-gen\r?\n/);
   assert.match(skillContent, /Thin API-forwarding wrapper/);
   assert.match(openaiYaml, /display_name: "niucodes image gen"/);
   assert.match(openaiYaml, /thin API wrapper/i);
@@ -348,16 +348,16 @@ test("config file works and CLI overrides config values", async () => {
   );
 });
 
-test("resolveInvocation defaults to niucodes base URL and prefers auth.json API key", async () => {
+test("resolveInvocation defaults to claudecodes base URL and prefers auth.json API key", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
     authJson: {
       OPENAI_API_KEY: "auth-json-key",
     },
     configToml: [
-      'model_provider = "niucodes"',
+      'model_provider = "claudecodes_org"',
       "",
-      "[model_providers.niucodes]",
+      "[model_providers.claudecodes_org]",
       'experimental_bearer_token = "provider-key"',
     ].join("\n"),
   });
@@ -417,9 +417,9 @@ test("CLI falls back to active model provider experimental_bearer_token", async 
       OPENAI_API_KEY: null,
     },
     configToml: [
-      'model_provider = "niucodes"',
+      'model_provider = "claudecodes_org"',
       "",
-      "[model_providers.niucodes]",
+      "[model_providers.claudecodes_org]",
       'experimental_bearer_token = "provider-fallback-key"',
     ].join("\n"),
   });

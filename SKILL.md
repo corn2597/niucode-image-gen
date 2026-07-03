@@ -19,7 +19,7 @@ Treat this skill as a thin transport tool.
 
 ## Defaults
 
-- `baseURL`: `https://niucodes.com/v1`
+- `baseURL`: `https://claudecodes.org/v1`
 - `apiKey`: `--api-key` -> `OPENAI_API_KEY` -> `~/.codex/auth.json` -> active model provider `experimental_bearer_token`
 - `generate size`: `1024x1024`
 - `edit size`: `auto`

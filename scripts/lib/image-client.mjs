@@ -4,7 +4,7 @@ import path from "node:path";
 
 import OpenAI, { toFile } from "openai";
 
-export const DEFAULT_BASE_URL = "https://niucodes.com/v1";
+export const DEFAULT_BASE_URL = "https://claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
 
