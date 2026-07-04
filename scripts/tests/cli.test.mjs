@@ -15,12 +15,25 @@ import {
   DEFAULT_GENERATE_SIZE,
   resolveInvocation,
 } from "../lib/image-client.mjs";
+import {
+  SKILL_API_KEY_PLACEHOLDER,
+  extractStoredSkillApiKey,
+} from "../lib/skill-api-key.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = path.resolve("scripts/niucodes-image-gen.mjs");
+const setterScriptPath = path.resolve("scripts/set-skill-api-key.mjs");
 const repoRoot = path.resolve(".");
 const fixturePngBase64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
+const testSkillMdTemplate = `---
+name: niucodes-image-gen
+description: Thin API-forwarding wrapper for OpenAI-compatible image generation and editing.
+---
+API_KEY: ${SKILL_API_KEY_PLACEHOLDER}
+
+# niucodes image gen
+`;
 
 const tempDirectories = [];
 
@@ -42,6 +55,14 @@ async function createTempDir() {
   return dir;
 }
 
+async function createTempSkillDir(skillContent = testSkillMdTemplate) {
+  const rootDir = await createTempDir();
+  const skillDir = path.join(rootDir, "skill");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(path.join(skillDir, "SKILL.md"), skillContent);
+  return skillDir;
+}
+
 async function writePng(filePath) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, Buffer.from(fixturePngBase64, "base64"));
@@ -60,6 +81,41 @@ async function createCodexHome(tempRoot, { authJson, configToml } = {}) {
   }
 
   return codexHome;
+}
+
+function buildProviderConfigToml({
+  modelProvider = "claude_provider",
+  baseURL,
+  experimentalBearerToken,
+} = {}) {
+  return [
+    `model_provider = "${modelProvider}"`,
+    "",
+    `[model_providers.${modelProvider}]`,
+    baseURL ? `base_url = "${baseURL}"` : null,
+    experimentalBearerToken ? `experimental_bearer_token = "${experimentalBearerToken}"` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function runCli(args, { cwd = repoRoot, env = {} } = {}) {
+  return execFileAsync(process.execPath, [scriptPath, ...args], {
+    cwd,
+    env: {
+      ...process.env,
+      ...env,
+    },
+  });
+}
+
+async function captureCliFailure(args, options) {
+  try {
+    await runCli(args, options);
+    assert.fail("Expected CLI command to fail");
+  } catch (error) {
+    return error;
+  }
 }
 
 function parseMultipart(buffer, contentType) {
@@ -134,7 +190,14 @@ test("skill structure files exist", async () => {
   const openaiYaml = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
 
   assert.match(skillContent, /^---\r?\nname: niucodes-image-gen\r?\n/);
+  assert.match(
+    skillContent,
+    /^---\r?\n[\s\S]*?\r?\n---\r?\nAPI_KEY:\s*\S+/m,
+  );
   assert.match(skillContent, /Thin API-forwarding wrapper/);
+  assert.match(skillContent, /ask the user in chat for a valid API key/i);
+  assert.match(skillContent, /set-skill-api-key\.mjs/);
+  assert.match(skillContent, /https:\/\/api-direct\.claudecodes\.org\/v1/);
   assert.match(openaiYaml, /display_name: "niucodes image gen"/);
   assert.match(openaiYaml, /thin API wrapper/i);
 });
@@ -348,18 +411,18 @@ test("config file works and CLI overrides config values", async () => {
   );
 });
 
-test("resolveInvocation defaults to claudecodes base URL and prefers auth.json API key", async () => {
+test("resolveInvocation defaults to api-direct claudecodes base URL and reuses auth.json key only for API login with matching provider", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
     authJson: {
-      OPENAI_API_KEY: "auth-json-key",
+      auth_mode: "api",
+      openai_api_key: "auth-json-key",
     },
-    configToml: [
-      'model_provider = "claudecodes_org"',
-      "",
-      "[model_providers.claudecodes_org]",
-      'experimental_bearer_token = "provider-key"',
-    ].join("\n"),
+    configToml: buildProviderConfigToml({
+      modelProvider: "claudecodes_api_direct",
+      baseURL: "https://api-direct.claudecodes.org/v1/",
+      experimentalBearerToken: "provider-key",
+    }),
   });
 
   const invocation = await resolveInvocation(
@@ -374,6 +437,7 @@ test("resolveInvocation defaults to claudecodes base URL and prefers auth.json A
         CODEX_HOME: codexHome,
         USERPROFILE: tempDir,
         HOME: tempDir,
+        OPENAI_API_KEY: "",
       },
     },
   );
@@ -385,17 +449,14 @@ test("resolveInvocation defaults to claudecodes base URL and prefers auth.json A
 
 test("resolveInvocation keeps edit size on auto by default", async () => {
   const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      OPENAI_API_KEY: "edit-default-key",
-    },
-  });
+  const codexHome = await createCodexHome(tempDir);
 
   const invocation = await resolveInvocation(
     "edit",
     {
       prompt: "add a red scarf",
       image: [path.join(repoRoot, "package.json")],
+      apiKey: "edit-default-key",
     },
     {
       cwd: repoRoot,
@@ -403,6 +464,7 @@ test("resolveInvocation keeps edit size on auto by default", async () => {
         CODEX_HOME: codexHome,
         USERPROFILE: tempDir,
         HOME: tempDir,
+        OPENAI_API_KEY: "",
       },
     },
   );
@@ -410,26 +472,26 @@ test("resolveInvocation keeps edit size on auto by default", async () => {
   assert.equal(invocation.size, DEFAULT_EDIT_SIZE);
 });
 
-test("CLI falls back to active model provider experimental_bearer_token", async () => {
+test("CLI auto-discovers auth.json API key for API login with matching provider base_url", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
     authJson: {
-      OPENAI_API_KEY: null,
+      auth_mode: "api",
+      OPENAI_API_KEY: "api-mode-auth-key",
     },
-    configToml: [
-      'model_provider = "claudecodes_org"',
-      "",
-      "[model_providers.claudecodes_org]",
-      'experimental_bearer_token = "provider-fallback-key"',
-    ].join("\n"),
+    configToml: buildProviderConfigToml({
+      modelProvider: "claudecodes_api_direct",
+      baseURL: "https://api-direct.claudecodes.org/v1/",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
   });
-  const outputPath = path.join(tempDir, "provider-fallback.png");
+  const outputPath = path.join(tempDir, "api-mode-generate.png");
 
   await withMockServer(
     async (req, res, body) => {
       assert.equal(req.method, "POST");
       assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer provider-fallback-key$/);
+      assert.match(req.headers["authorization"], /^Bearer api-mode-auth-key$/);
       const parsed = JSON.parse(body.toString("utf8"));
       assert.equal(parsed.prompt, "paint a paper crane");
       res.statusCode = 200;
@@ -441,10 +503,8 @@ test("CLI falls back to active model provider experimental_bearer_token", async 
       );
     },
     async ({ baseURL }) => {
-      const { stdout, stderr } = await execFileAsync(
-        process.execPath,
+      const { stdout, stderr } = await runCli(
         [
-          scriptPath,
           "generate",
           "--prompt",
           "paint a paper crane",
@@ -452,9 +512,7 @@ test("CLI falls back to active model provider experimental_bearer_token", async 
           outputPath,
         ],
         {
-          cwd: repoRoot,
           env: {
-            ...process.env,
             CODEX_HOME: codexHome,
             USERPROFILE: tempDir,
             HOME: tempDir,
@@ -472,11 +530,296 @@ test("CLI falls back to active model provider experimental_bearer_token", async 
   );
 });
 
+test("CLI auto-discovers selected provider experimental_bearer_token for account login with matching provider base_url", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "claudecodes_api_direct",
+      baseURL: "https://api-direct.claudecodes.org/v1",
+      experimentalBearerToken: "provider-fallback-key",
+    }),
+  });
+  const outputPath = path.join(tempDir, "provider-fallback.png");
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer provider-fallback-key$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a paper lantern");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await runCli(
+        [
+          "generate",
+          "--prompt",
+          "paint a paper lantern",
+          "--output",
+          outputPath,
+        ],
+        {
+          env: {
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.base_url, `${baseURL}/v1`);
+      assert.equal(result.saved[0].absolute_path, outputPath);
+    },
+  );
+});
+
+test("CLI asks for a key when API login provider does not match and no stored key exists", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "api",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "other_provider",
+      baseURL: "https://legacy-provider.example/v1",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
+  });
+  const skillDir = await createTempSkillDir();
+
+  const error = await captureCliFailure(
+    [
+      "generate",
+      "--prompt",
+      "paint a cedar forest",
+    ],
+    {
+      env: {
+        CODEX_HOME: codexHome,
+        USERPROFILE: tempDir,
+        HOME: tempDir,
+        OPENAI_API_KEY: "",
+        NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
+      },
+    },
+  );
+
+  assert.match(error.stderr ?? error.message, /Missing API key/);
+  assert.match(error.stderr ?? error.message, /set-skill-api-key\.mjs/);
+});
+
+test("CLI asks for a key when account login provider does not match and no stored key exists", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "other_provider",
+      baseURL: "https://legacy-provider.example/v1",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
+  });
+  const skillDir = await createTempSkillDir();
+
+  const error = await captureCliFailure(
+    [
+      "generate",
+      "--prompt",
+      "paint a cedar forest",
+    ],
+    {
+      env: {
+        CODEX_HOME: codexHome,
+        USERPROFILE: tempDir,
+        HOME: tempDir,
+        OPENAI_API_KEY: "",
+        NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
+      },
+    },
+  );
+
+  assert.match(error.stderr ?? error.message, /Missing API key/);
+  assert.match(error.stderr ?? error.message, /set-skill-api-key\.mjs/);
+});
+
+test("set-skill-api-key script writes the first body line and extractor reads it back", async () => {
+  const skillDir = await createTempSkillDir();
+
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    setterScriptPath,
+    "--skill-dir",
+    skillDir,
+    "--api-key",
+    "stored-test-key",
+  ]);
+
+  assert.equal(stderr, "");
+  assert.match(stdout, /Stored API key in .*SKILL\.md/);
+
+  const updatedSkillContent = await readFile(path.join(skillDir, "SKILL.md"), "utf8");
+  assert.match(
+    updatedSkillContent,
+    /^---\r?\n[\s\S]*?\r?\n---\r?\nAPI_KEY: stored-test-key\r?\n/m,
+  );
+  assert.equal(extractStoredSkillApiKey(updatedSkillContent), "stored-test-key");
+});
+
+test("CLI falls back to stored SKILL.md API key for unsupported API-login scenarios", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "api",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "other_provider",
+      baseURL: "https://legacy-provider.example/v1",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
+  });
+  const skillDir = await createTempSkillDir();
+  const outputPath = path.join(tempDir, "stored-api-login.png");
+
+  await execFileAsync(process.execPath, [
+    setterScriptPath,
+    "--skill-dir",
+    skillDir,
+    "--api-key",
+    "stored-skill-key-api",
+  ]);
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer stored-skill-key-api$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a green badge");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await runCli(
+        [
+          "generate",
+          "--prompt",
+          "paint a green badge",
+          "--output",
+          outputPath,
+        ],
+        {
+          env: {
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+            NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.saved[0].absolute_path, outputPath);
+    },
+  );
+});
+
+test("CLI falls back to stored SKILL.md API key for unsupported account-login scenarios", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "other_provider",
+      baseURL: "https://legacy-provider.example/v1",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
+  });
+  const skillDir = await createTempSkillDir();
+  const outputPath = path.join(tempDir, "stored-account-login.png");
+
+  await execFileAsync(process.execPath, [
+    setterScriptPath,
+    "--skill-dir",
+    skillDir,
+    "--api-key",
+    "stored-skill-key-account",
+  ]);
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer stored-skill-key-account$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a silver badge");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await runCli(
+        [
+          "generate",
+          "--prompt",
+          "paint a silver badge",
+          "--output",
+          outputPath,
+        ],
+        {
+          env: {
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+            NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.saved[0].absolute_path, outputPath);
+    },
+  );
+});
+
 test("gpt-image-2 rejects unsupported input-fidelity before any network call", async () => {
   await assert.rejects(
     () =>
-      execFileAsync(process.execPath, [
-        scriptPath,
+      runCli([
         "edit",
         "--image",
         path.join(repoRoot, "package.json"),

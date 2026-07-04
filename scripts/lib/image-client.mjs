@@ -3,10 +3,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import OpenAI, { toFile } from "openai";
+import { readStoredSkillApiKey } from "./skill-api-key.mjs";
 
-export const DEFAULT_BASE_URL = "https://claudecodes.org/v1";
+export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
+export const SUPPORTED_PROVIDER_BASE_URL = "https://api-direct.claudecodes.org/v1";
 
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -35,6 +37,14 @@ function mergeDefinedObjects(...sources) {
     }
   }
   return merged;
+}
+
+function normalizeUrlForMatch(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  return String(value).trim().replace(/\/+$/, "").toLowerCase();
 }
 
 function parseBoolean(value, fallback = false) {
@@ -125,6 +135,78 @@ function readEnvironmentConfig(env) {
   });
 }
 
+function extractTopLevelTomlString(rawToml, keyName) {
+  if (!rawToml) {
+    return undefined;
+  }
+
+  const lines = rawToml.split(/\r?\n/);
+  let insideSection = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      insideSection = true;
+      continue;
+    }
+
+    if (insideSection) {
+      continue;
+    }
+
+    const match = line.match(new RegExp(`^\\s*${keyName}\\s*=\\s*"([^"]+)"`));
+    if (match?.[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+
+  return undefined;
+}
+
+function extractTomlSectionString(rawToml, sectionName, keyName) {
+  if (!rawToml || !sectionName) {
+    return undefined;
+  }
+
+  const lines = rawToml.split(/\r?\n/);
+  const targetSectionHeader = `[${sectionName}]`;
+  let insideTargetSection = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      insideTargetSection = trimmed === targetSectionHeader;
+      continue;
+    }
+
+    if (!insideTargetSection) {
+      continue;
+    }
+
+    const match = line.match(new RegExp(`^\\s*${keyName}\\s*=\\s*"([^"]+)"`));
+    if (match?.[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+
+  return undefined;
+}
+
+function extractSelectedProviderConfig(rawToml) {
+  const modelProvider = extractTopLevelTomlString(rawToml, "model_provider");
+  if (!modelProvider) {
+    return {};
+  }
+
+  const sectionName = `model_providers.${modelProvider}`;
+  return {
+    modelProvider,
+    baseURL: extractTomlSectionString(rawToml, sectionName, "base_url"),
+    experimentalBearerToken: extractTomlSectionString(rawToml, sectionName, "experimental_bearer_token"),
+  };
+}
+
 function resolveCodexHome(env) {
   if (env.CODEX_HOME) {
     return env.CODEX_HOME;
@@ -159,6 +241,7 @@ function extractAuthJsonApiKey(rawAuth) {
 
   const candidateFields = [
     "OPENAI_API_KEY",
+    "openai_api_key",
     "LUPOAPI_API_KEY",
     "LUOAPI_API_KEY",
     "API_KEY",
@@ -176,40 +259,25 @@ function extractAuthJsonApiKey(rawAuth) {
   return undefined;
 }
 
-function extractProviderExperimentalBearerToken(rawToml) {
-  if (!rawToml) {
+function extractAuthMode(rawAuth) {
+  if (!rawAuth || typeof rawAuth !== "object") {
     return undefined;
   }
 
-  const providerMatch = rawToml.match(/^\s*model_provider\s*=\s*"([^"]+)"/m);
-  const providerName = providerMatch?.[1]?.trim();
-  if (!providerName) {
+  const authMode = rawAuth.auth_mode;
+  if (typeof authMode !== "string" || authMode.trim() === "") {
     return undefined;
   }
 
-  const lines = rawToml.split(/\r?\n/);
-  const targetSectionHeader = `[model_providers.${providerName}]`;
-  let insideTargetSection = false;
+  return authMode.trim().toLowerCase();
+}
 
-  for (const line of lines) {
-    const trimmed = line.trim();
+function isApiLoginMode(authMode) {
+  return authMode === "api";
+}
 
-    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-      insideTargetSection = trimmed === targetSectionHeader;
-      continue;
-    }
-
-    if (!insideTargetSection) {
-      continue;
-    }
-
-    const tokenMatch = line.match(/^\s*experimental_bearer_token\s*=\s*"([^"]+)"/);
-    if (tokenMatch?.[1]?.trim()) {
-      return tokenMatch[1].trim();
-    }
-  }
-
-  return undefined;
+function isAccountLoginMode(authMode) {
+  return authMode === "chatgpt" || authMode === "account";
 }
 
 async function readDiscoveredCredentials(env) {
@@ -220,22 +288,38 @@ async function readDiscoveredCredentials(env) {
 
   const authJsonPath = path.join(codexHome, "auth.json");
   const authJsonText = await readTextIfExists(authJsonPath);
+  const configTomlPath = path.join(codexHome, "config.toml");
+  const configTomlText = await readTextIfExists(configTomlPath);
+  const selectedProviderConfig = extractSelectedProviderConfig(configTomlText);
+  const selectedProviderMatches =
+    normalizeUrlForMatch(selectedProviderConfig.baseURL) === normalizeUrlForMatch(SUPPORTED_PROVIDER_BASE_URL);
+
   if (authJsonText) {
     const authJson = JSON.parse(authJsonText);
-    const authJsonApiKey = extractAuthJsonApiKey(authJson);
-    if (authJsonApiKey) {
-      return {
-        apiKey: authJsonApiKey,
-      };
+    const authMode = extractAuthMode(authJson);
+
+    if (isApiLoginMode(authMode) && selectedProviderMatches) {
+      const authJsonApiKey = extractAuthJsonApiKey(authJson);
+      if (authJsonApiKey) {
+        return {
+          apiKey: authJsonApiKey,
+        };
+      }
+    }
+
+    if (isAccountLoginMode(authMode) && selectedProviderConfig.modelProvider && selectedProviderMatches) {
+      if (selectedProviderConfig.experimentalBearerToken) {
+        return {
+          apiKey: selectedProviderConfig.experimentalBearerToken,
+        };
+      }
     }
   }
 
-  const configTomlPath = path.join(codexHome, "config.toml");
-  const configTomlText = await readTextIfExists(configTomlPath);
-  const experimentalBearerToken = extractProviderExperimentalBearerToken(configTomlText);
-  if (experimentalBearerToken) {
+  const storedSkillApiKey = await readStoredSkillApiKey(env);
+  if (storedSkillApiKey) {
     return {
-      apiKey: experimentalBearerToken,
+      apiKey: storedSkillApiKey,
     };
   }
 
@@ -375,7 +459,7 @@ export async function resolveInvocation(command, cliOptions, { cwd, env }) {
 
   if (!invocation.apiKey) {
     throw new Error(
-      "Missing API key. Pass --api-key, set OPENAI_API_KEY, add a key to ~/.codex/auth.json, or configure experimental_bearer_token for the active model provider.",
+      "Missing API key. Auto-discovery only works for Codex API login with current provider base_url https://api-direct.claudecodes.org/v1 (reusing auth.json openai_api_key) or Codex account login with selected model_provider base_url https://api-direct.claudecodes.org/v1 (reusing provider experimental_bearer_token). Otherwise provide a valid API key via --api-key, OPENAI_API_KEY, config.json apiKey, or persist it into the first-body-line API_KEY in SKILL.md by running scripts/set-skill-api-key.mjs after asking the user in chat.",
     );
   }
   if (!invocation.prompt) {
