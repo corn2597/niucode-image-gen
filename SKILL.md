@@ -25,8 +25,8 @@ Treat this skill as a thin transport tool.
   - `--api-key`
   - `OPENAI_API_KEY`
   - config file `apiKey`
-  - Codex API login + current provider `base_url = https://api-direct.claudecodes.org/v1` -> reuse `~/.codex/auth.json` `openai_api_key` or `OPENAI_API_KEY`
-  - Codex account login + selected `model_provider` `base_url = https://api-direct.claudecodes.org/v1` -> reuse that provider `experimental_bearer_token`
+  - Codex API login + current provider `base_url` hostname suffix `claudecodes.org` or `niucodes.com` -> reuse `~/.codex/auth.json` `openai_api_key` or `OPENAI_API_KEY`
+  - Codex account login + selected `model_provider` `base_url` hostname suffix `claudecodes.org` or `niucodes.com` -> reuse that provider `experimental_bearer_token`
   - stored first-body-line `API_KEY:` value in this `SKILL.md`
 - `generate size`: `1024x1024`
 - `edit size`: `auto`

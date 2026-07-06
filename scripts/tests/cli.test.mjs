@@ -198,6 +198,8 @@ test("skill structure files exist", async () => {
   assert.match(skillContent, /ask the user in chat for a valid API key/i);
   assert.match(skillContent, /set-skill-api-key\.mjs/);
   assert.match(skillContent, /https:\/\/api-direct\.claudecodes\.org\/v1/);
+  assert.match(skillContent, /claudecodes\.org/);
+  assert.match(skillContent, /niucodes\.com/);
   assert.match(openaiYaml, /display_name: "niucodes image gen"/);
   assert.match(openaiYaml, /thin API wrapper/i);
 });
@@ -411,7 +413,7 @@ test("config file works and CLI overrides config values", async () => {
   );
 });
 
-test("resolveInvocation defaults to api-direct claudecodes base URL and reuses auth.json key only for API login with matching provider", async () => {
+test("resolveInvocation defaults to api-direct base URL and reuses auth.json key for claudecodes.org subdomain provider matching", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
     authJson: {
@@ -419,7 +421,7 @@ test("resolveInvocation defaults to api-direct claudecodes base URL and reuses a
       openai_api_key: "auth-json-key",
     },
     configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_api_direct",
+      modelProvider: "claudecodes_subdomain",
       baseURL: "https://api-direct.claudecodes.org/v1/",
       experimentalBearerToken: "provider-key",
     }),
@@ -445,6 +447,41 @@ test("resolveInvocation defaults to api-direct claudecodes base URL and reuses a
   assert.equal(invocation.apiKey, "auth-json-key");
   assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
   assert.equal(invocation.size, DEFAULT_GENERATE_SIZE);
+});
+
+test("resolveInvocation reuses provider experimental token for niucodes.com subdomain provider matching", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "niucodes_subdomain",
+      baseURL: "https://img.niucodes.com/v1/",
+      experimentalBearerToken: "niucodes-subdomain-token",
+    }),
+  });
+
+  const invocation = await resolveInvocation(
+    "generate",
+    {
+      prompt: "draw a lantern festival",
+      image: [],
+    },
+    {
+      cwd: repoRoot,
+      env: {
+        CODEX_HOME: codexHome,
+        USERPROFILE: tempDir,
+        HOME: tempDir,
+        OPENAI_API_KEY: "",
+      },
+    },
+  );
+
+  assert.equal(invocation.apiKey, "niucodes-subdomain-token");
+  assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
 });
 
 test("resolveInvocation keeps edit size on auto by default", async () => {
@@ -480,8 +517,8 @@ test("CLI auto-discovers auth.json API key for API login with matching provider 
       OPENAI_API_KEY: "api-mode-auth-key",
     },
     configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_api_direct",
-      baseURL: "https://api-direct.claudecodes.org/v1/",
+      modelProvider: "claudecodes_org",
+      baseURL: "https://claudecodes.org/v1/",
       experimentalBearerToken: "ignored-provider-token",
     }),
   });
@@ -530,6 +567,64 @@ test("CLI auto-discovers auth.json API key for API login with matching provider 
   );
 });
 
+test("CLI auto-discovers auth.json API key for API login with niucodes.com exact provider base_url", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "api",
+      OPENAI_API_KEY: "api-mode-niucodes-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "niucodes_org",
+      baseURL: "https://niucodes.com/v1/",
+      experimentalBearerToken: "ignored-provider-token",
+    }),
+  });
+  const outputPath = path.join(tempDir, "api-mode-niucodes.png");
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer api-mode-niucodes-key$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a folded boat");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await runCli(
+        [
+          "generate",
+          "--prompt",
+          "paint a folded boat",
+          "--output",
+          outputPath,
+        ],
+        {
+          env: {
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.base_url, `${baseURL}/v1`);
+      assert.equal(result.saved[0].absolute_path, outputPath);
+    },
+  );
+});
+
 test("CLI auto-discovers selected provider experimental_bearer_token for account login with matching provider base_url", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
@@ -538,8 +633,8 @@ test("CLI auto-discovers selected provider experimental_bearer_token for account
       OPENAI_API_KEY: "ignored-auth-json-key",
     },
     configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_api_direct",
-      baseURL: "https://api-direct.claudecodes.org/v1",
+      modelProvider: "niucodes_org",
+      baseURL: "https://niucodes.com/v1",
       experimentalBearerToken: "provider-fallback-key",
     }),
   });
@@ -588,6 +683,64 @@ test("CLI auto-discovers selected provider experimental_bearer_token for account
   );
 });
 
+test("CLI auto-discovers selected provider experimental_bearer_token for account login with claudecodes.org subdomain provider base_url", async () => {
+  const tempDir = await createTempDir();
+  const codexHome = await createCodexHome(tempDir, {
+    authJson: {
+      auth_mode: "chatgpt",
+      OPENAI_API_KEY: "ignored-auth-json-key",
+    },
+    configToml: buildProviderConfigToml({
+      modelProvider: "claudecodes_subdomain",
+      baseURL: "https://api-direct.claudecodes.org/v1",
+      experimentalBearerToken: "claudecodes-subdomain-token",
+    }),
+  });
+  const outputPath = path.join(tempDir, "claudecodes-subdomain.png");
+
+  await withMockServer(
+    async (req, res, body) => {
+      assert.equal(req.method, "POST");
+      assert.equal(req.url, "/v1/images/generations");
+      assert.match(req.headers["authorization"], /^Bearer claudecodes-subdomain-token$/);
+      const parsed = JSON.parse(body.toString("utf8"));
+      assert.equal(parsed.prompt, "paint a folded crane");
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          data: [{ b64_json: fixturePngBase64 }],
+        }),
+      );
+    },
+    async ({ baseURL }) => {
+      const { stdout, stderr } = await runCli(
+        [
+          "generate",
+          "--prompt",
+          "paint a folded crane",
+          "--output",
+          outputPath,
+        ],
+        {
+          env: {
+            CODEX_HOME: codexHome,
+            USERPROFILE: tempDir,
+            HOME: tempDir,
+            OPENAI_API_KEY: "",
+            OPENAI_BASE_URL: `${baseURL}/v1`,
+          },
+        },
+      );
+
+      assert.equal(stderr, "");
+      const result = JSON.parse(stdout);
+      assert.equal(result.base_url, `${baseURL}/v1`);
+      assert.equal(result.saved[0].absolute_path, outputPath);
+    },
+  );
+});
+
 test("CLI asks for a key when API login provider does not match and no stored key exists", async () => {
   const tempDir = await createTempDir();
   const codexHome = await createCodexHome(tempDir, {
@@ -597,7 +750,7 @@ test("CLI asks for a key when API login provider does not match and no stored ke
     },
     configToml: buildProviderConfigToml({
       modelProvider: "other_provider",
-      baseURL: "https://legacy-provider.example/v1",
+      baseURL: "https://example.com/v1",
       experimentalBearerToken: "ignored-provider-token",
     }),
   });
@@ -633,7 +786,7 @@ test("CLI asks for a key when account login provider does not match and no store
     },
     configToml: buildProviderConfigToml({
       modelProvider: "other_provider",
-      baseURL: "https://legacy-provider.example/v1",
+      baseURL: "https://example.com/v1",
       experimentalBearerToken: "ignored-provider-token",
     }),
   });
@@ -691,7 +844,7 @@ test("CLI falls back to stored SKILL.md API key for unsupported API-login scenar
     },
     configToml: buildProviderConfigToml({
       modelProvider: "other_provider",
-      baseURL: "https://legacy-provider.example/v1",
+      baseURL: "https://example.com/v1",
       experimentalBearerToken: "ignored-provider-token",
     }),
   });
@@ -758,7 +911,7 @@ test("CLI falls back to stored SKILL.md API key for unsupported account-login sc
     },
     configToml: buildProviderConfigToml({
       modelProvider: "other_provider",
-      baseURL: "https://legacy-provider.example/v1",
+      baseURL: "https://example.com/v1",
       experimentalBearerToken: "ignored-provider-token",
     }),
   });

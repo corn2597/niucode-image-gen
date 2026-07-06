@@ -8,7 +8,7 @@ import { readStoredSkillApiKey } from "./skill-api-key.mjs";
 export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
-export const SUPPORTED_PROVIDER_BASE_URL = "https://api-direct.claudecodes.org/v1";
+export const SUPPORTED_PROVIDER_DOMAIN_SUFFIXES = ["claudecodes.org", "niucodes.com"];
 
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -45,6 +45,30 @@ function normalizeUrlForMatch(value) {
   }
 
   return String(value).trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function extractHostnameFromUrl(value) {
+  const normalized = normalizeUrlForMatch(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  try {
+    return new URL(normalized).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+function matchesSupportedProviderDomainSuffix(value) {
+  const hostname = extractHostnameFromUrl(value);
+  if (!hostname) {
+    return false;
+  }
+
+  return SUPPORTED_PROVIDER_DOMAIN_SUFFIXES.some(
+    (suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`),
+  );
 }
 
 function parseBoolean(value, fallback = false) {
@@ -291,8 +315,7 @@ async function readDiscoveredCredentials(env) {
   const configTomlPath = path.join(codexHome, "config.toml");
   const configTomlText = await readTextIfExists(configTomlPath);
   const selectedProviderConfig = extractSelectedProviderConfig(configTomlText);
-  const selectedProviderMatches =
-    normalizeUrlForMatch(selectedProviderConfig.baseURL) === normalizeUrlForMatch(SUPPORTED_PROVIDER_BASE_URL);
+  const selectedProviderMatches = matchesSupportedProviderDomainSuffix(selectedProviderConfig.baseURL);
 
   if (authJsonText) {
     const authJson = JSON.parse(authJsonText);
@@ -459,7 +482,7 @@ export async function resolveInvocation(command, cliOptions, { cwd, env }) {
 
   if (!invocation.apiKey) {
     throw new Error(
-      "Missing API key. Auto-discovery only works for Codex API login with current provider base_url https://api-direct.claudecodes.org/v1 (reusing auth.json openai_api_key) or Codex account login with selected model_provider base_url https://api-direct.claudecodes.org/v1 (reusing provider experimental_bearer_token). Otherwise provide a valid API key via --api-key, OPENAI_API_KEY, config.json apiKey, or persist it into the first-body-line API_KEY in SKILL.md by running scripts/set-skill-api-key.mjs after asking the user in chat.",
+      "Missing API key. Auto-discovery only works when the current or selected provider base_url hostname ends with claudecodes.org or niucodes.com. In API login, the skill reuses auth.json openai_api_key. In account login, the skill reuses the provider experimental_bearer_token. Otherwise provide a valid API key via --api-key, OPENAI_API_KEY, config.json apiKey, or persist it into the first-body-line API_KEY in SKILL.md by running scripts/set-skill-api-key.mjs after asking the user in chat.",
     );
   }
   if (!invocation.prompt) {

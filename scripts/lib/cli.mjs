@@ -29,10 +29,10 @@ Commands:
 Common options:
   --config <path>               Load JSON config. CLI flags override config values.
   --api-key <key>               API key. Otherwise use OPENAI_API_KEY, config apiKey,
-                                Codex API login + provider base_url
-                                https://api-direct.claudecodes.org/v1 -> auth.json openai_api_key,
-                                Codex account login + selected model_provider base_url
-                                https://api-direct.claudecodes.org/v1 -> experimental_bearer_token,
+                                Codex API login + provider hostname suffix
+                                claudecodes.org or niucodes.com -> auth.json openai_api_key,
+                                Codex account login + selected model_provider hostname suffix
+                                claudecodes.org or niucodes.com -> experimental_bearer_token,
                                 or the stored first-body-line API_KEY in SKILL.md.
   --base-url <url>              SDK baseURL. Defaults to ${DEFAULT_BASE_URL}.
   --model <model>               Defaults to gpt-image-2 or OPENAI_IMAGE_MODEL.
