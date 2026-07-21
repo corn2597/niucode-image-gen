@@ -30,7 +30,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(node -p \"require('./package.json').version\")"
+          version="${{ inputs.tag }}"
+          version="${version#v}"
           gh release upload "${{ inputs.tag }}" \
             "release/niucodes-image-gen-v${version}.zip" \
             "release/niucodes-image-gen-macos-arm64-v${version}.zip" \
