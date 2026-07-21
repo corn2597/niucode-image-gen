@@ -1,0 +1,40 @@
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag to receive the release assets
+        required: true
+        default: v1.1.1
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build:release
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p \"require('./package.json').version\")"
+          gh release upload "${{ inputs.tag }}" \
+            "release/niucodes-image-gen-v${version}.zip" \
+            "release/niucodes-image-gen-macos-arm64-v${version}.zip" \
+            "release/niucodes-image-gen-macos-x64-v${version}.zip" \
+            "release/niucodes-image-gen-win-x64-v${version}.zip" \
+            release/SHA256SUMS.txt \
+            --clobber
