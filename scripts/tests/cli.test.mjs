@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,43 +10,25 @@ import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 
 import {
-  DEFAULT_BASE_URL,
   DEFAULT_EDIT_SIZE,
   DEFAULT_GENERATE_SIZE,
+  resolveConfigPath,
   resolveInvocation,
 } from "../lib/image-client.mjs";
-import {
-  SKILL_API_KEY_PLACEHOLDER,
-  extractStoredSkillApiKey,
-} from "../lib/skill-api-key.mjs";
+import { installSkill, upsertMcpServerConfig } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
-const scriptPath = path.resolve("scripts/niucodes-image-gen.mjs");
-const setterScriptPath = path.resolve("scripts/set-skill-api-key.mjs");
 const repoRoot = path.resolve(".");
-const fixturePngBase64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
-const testSkillMdTemplate = `---
-name: niucodes-image-gen
-description: Thin API-forwarding wrapper for OpenAI-compatible image generation and editing.
----
-API_KEY: ${SKILL_API_KEY_PLACEHOLDER}
-
-# niucodes image gen
-`;
-
+const scriptPath = path.join(repoRoot, "scripts", "niucodes-image-gen.mjs");
+const windowsRunnerPath = path.join(repoRoot, "scripts", "invoke-imagegen.ps1");
+const macosRunnerPath = path.join(repoRoot, "scripts", "invoke-imagegen.sh");
+const macosArm64BinaryPath = path.join(repoRoot, "bin", "niucodes-image-gen-macos-arm64");
+const fixturePngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
 const tempDirectories = [];
 
 afterEach(async () => {
-  while (tempDirectories.length > 0) {
-    const dir = tempDirectories.pop();
-    await import("node:fs/promises").then(({ rm }) =>
-      rm(dir, {
-        recursive: true,
-        force: true,
-      }),
-    );
-  }
+  const { rm } = await import("node:fs/promises");
+  await Promise.all(tempDirectories.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 async function createTempDir() {
@@ -55,934 +37,524 @@ async function createTempDir() {
   return dir;
 }
 
-async function createTempSkillDir(skillContent = testSkillMdTemplate) {
-  const rootDir = await createTempDir();
-  const skillDir = path.join(rootDir, "skill");
-  await mkdir(skillDir, { recursive: true });
-  await writeFile(path.join(skillDir, "SKILL.md"), skillContent);
-  return skillDir;
-}
-
 async function writePng(filePath) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, Buffer.from(fixturePngBase64, "base64"));
 }
 
-async function createCodexHome(tempRoot, { authJson, configToml } = {}) {
-  const codexHome = path.join(tempRoot, ".codex");
-  await mkdir(codexHome, { recursive: true });
-
-  if (authJson !== undefined) {
-    await writeFile(path.join(codexHome, "auth.json"), JSON.stringify(authJson, null, 2));
-  }
-
-  if (configToml !== undefined) {
-    await writeFile(path.join(codexHome, "config.toml"), configToml);
-  }
-
-  return codexHome;
-}
-
-function buildProviderConfigToml({
-  modelProvider = "claude_provider",
-  baseURL,
-  experimentalBearerToken,
-} = {}) {
-  return [
-    `model_provider = "${modelProvider}"`,
-    "",
-    `[model_providers.${modelProvider}]`,
-    baseURL ? `base_url = "${baseURL}"` : null,
-    experimentalBearerToken ? `experimental_bearer_token = "${experimentalBearerToken}"` : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function runCli(args, { cwd = repoRoot, env = {} } = {}) {
-  return execFileAsync(process.execPath, [scriptPath, ...args], {
-    cwd,
-    env: {
-      ...process.env,
-      ...env,
-    },
-  });
-}
-
-async function captureCliFailure(args, options) {
-  try {
-    await runCli(args, options);
-    assert.fail("Expected CLI command to fail");
-  } catch (error) {
-    return error;
-  }
-}
-
-function parseMultipart(buffer, contentType) {
-  const boundaryMatch = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType ?? "");
-  assert.ok(boundaryMatch, "multipart boundary should exist");
-  const boundary = boundaryMatch[1] ?? boundaryMatch[2];
-  const delimiter = `--${boundary}`;
-  const bodyText = buffer.toString("latin1");
-  const rawParts = bodyText
-    .split(delimiter)
-    .slice(1, -1)
-    .map((part) => part.replace(/^\r\n/, "").replace(/\r\n$/, ""));
-
-  return rawParts.map((part) => {
-    const [rawHeaders, rawBody] = part.split("\r\n\r\n");
-    const headerLines = rawHeaders.split("\r\n");
-    const headers = {};
-    for (const line of headerLines) {
-      const separatorIndex = line.indexOf(":");
-      const key = line.slice(0, separatorIndex).trim().toLowerCase();
-      const value = line.slice(separatorIndex + 1).trim();
-      headers[key] = value;
-    }
-    const disposition = headers["content-disposition"] ?? "";
-    const nameMatch = /name="([^"]+)"/i.exec(disposition);
-    const fileMatch = /filename="([^"]+)"/i.exec(disposition);
-    return {
-      name: nameMatch?.[1] ?? null,
-      filename: fileMatch?.[1] ?? null,
-      contentType: headers["content-type"] ?? null,
-      body: rawBody.replace(/\r\n$/, ""),
-    };
-  });
-}
-
-async function withMockServer(routeHandler, run) {
-  const requests = [];
+async function withMockServer(handler, run) {
   const server = createServer(async (req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
-    req.on("end", async () => {
-      const body = Buffer.concat(chunks);
-      requests.push({
-        method: req.method,
-        url: req.url,
-        headers: req.headers,
-        body,
-      });
-      try {
-        await routeHandler(req, res, body);
-      } catch (error) {
-        res.statusCode = 500;
-        res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ error: String(error) }));
-      }
-    });
+    req.on("end", async () => handler(req, res, Buffer.concat(chunks)));
   });
-
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  const baseURL = `http://127.0.0.1:${address.port}`;
-
+  const { port } = server.address();
   try {
-    await run({ baseURL, requests });
+    await run(`http://127.0.0.1:${port}/v1`);
   } finally {
-    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 }
 
-test("skill structure files exist", async () => {
-  const skillContent = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
-  const openaiYaml = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
+async function startMcpClient({ skillRoot, executable = process.execPath, executableArgs = [scriptPath, "mcp"] }) {
+  const child = spawn(executable, executableArgs, {
+    cwd: repoRoot,
+    env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let pending = "";
+  let stderr = "";
+  const responses = new Map();
+  const waiters = new Map();
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdout.on("data", (chunk) => {
+    pending += chunk;
+    const lines = pending.split("\n");
+    pending = lines.pop();
+    for (const line of lines) {
+      const message = JSON.parse(line);
+      const waiter = waiters.get(message.id);
+      if (waiter) {
+        waiters.delete(message.id);
+        waiter.resolve(message);
+      } else {
+        responses.set(message.id, message);
+      }
+    }
+  });
+  let nextId = 1;
+  return {
+    async request(method, params = {}) {
+      const id = nextId++;
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      if (responses.has(id)) return responses.get(id);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          waiters.delete(id);
+          reject(new Error(`Timed out waiting for MCP response: ${method}`));
+        }, 5000);
+        waiters.set(id, {
+          resolve: (message) => {
+            clearTimeout(timeout);
+            resolve(message);
+          },
+        });
+      });
+    },
+    async close() {
+      child.stdin.end();
+      await new Promise((resolve) => child.once("exit", resolve));
+      return stderr;
+    },
+  };
+}
 
-  assert.match(skillContent, /^---\r?\nname: niucodes-image-gen\r?\n/);
-  assert.match(
-    skillContent,
-    /^---\r?\n[\s\S]*?\r?\n---\r?\nAPI_KEY:\s*\S+/m,
-  );
-  assert.match(skillContent, /Thin API-forwarding wrapper/);
-  assert.match(skillContent, /ask the user in chat for a valid API key/i);
-  assert.match(skillContent, /set-skill-api-key\.mjs/);
-  assert.match(skillContent, /https:\/\/api-direct\.claudecodes\.org\/v1/);
-  assert.match(skillContent, /claudecodes\.org/);
-  assert.match(skillContent, /niucodes\.com/);
-  assert.match(openaiYaml, /display_name: "niucodes image gen"/);
-  assert.match(openaiYaml, /thin API wrapper/i);
+test("skill uses a root config file and has no stored key or key setter flow", async () => {
+  const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
+  const config = JSON.parse(await readFile(path.join(repoRoot, "config.json"), "utf8"));
+  assert.equal(resolveConfigPath(undefined), path.join(repoRoot, "config.json"));
+  assert.equal(config.apiKey, "");
+  assert.match(skill, /only API credential source/i);
+  assert.doesNotMatch(skill, /set-skill-api-key|OPENAI_API_KEY|API_KEY:/i);
 });
 
-test("generate command sends JSON request and saves renderable output", async () => {
+test("skill uses native MCP tools and does not prescribe a terminal runner for normal calls", async () => {
+  const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
+  assert.match(skill, /native MCP tool/i);
+  assert.match(skill, /imagegen_generate/);
+  assert.match(skill, /imagegen_edit/);
+  assert.match(skill, /Never use a shell, runner, status file/i);
+  assert.match(skill, /Do not call any tool after a successful result/i);
+});
+
+test("Windows installation entrypoint runs the bundled executable in install mode", async () => {
+  const installer = await readFile(path.join(repoRoot, "scripts", "install-windows.cmd"), "utf8");
+  assert.match(installer, /niucodes-image-gen-win-x64\.exe/i);
+  assert.match(installer, /"%EXECUTABLE%" install/i);
+  assert.match(installer, /Restart Codex Desktop/i);
+});
+
+test("Windows runner atomically replaces status files without File.Replace", async () => {
+  const runner = await readFile(windowsRunnerPath, "utf8");
+  assert.match(runner, /MoveFileEx/);
+  assert.match(runner, /MOVEFILE_REPLACE_EXISTING/);
+  assert.doesNotMatch(runner, /\[System\.IO\.File\]::Replace/);
+});
+
+test("MCP config upsert preserves unrelated server configuration", () => {
+  const initial = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n';
+  const updated = upsertMcpServerConfig(initial, { command: "/Applications/Image Gen", cwd: "/Applications" });
+  assert.match(updated, /\[mcp_servers\.other\]/);
+  assert.match(updated, /command = "\/Applications\/Image Gen"/);
+  assert.equal((updated.match(/\[mcp_servers\.niucodes_image_gen\]/g) ?? []).length, 1);
+});
+
+test("installer copies runtime files, preserves config, and configures native MCP", async () => {
   const tempDir = await createTempDir();
-  const outputPath = path.join(tempDir, "generated.png");
+  const sourceRoot = path.join(tempDir, "source skill");
+  const installDir = path.join(tempDir, "installed skill");
+  const configPath = path.join(tempDir, "codex", "config.toml");
+  await mkdir(path.join(sourceRoot, "bin"), { recursive: true });
+  await mkdir(path.join(sourceRoot, "scripts"), { recursive: true });
+  await writeFile(path.join(sourceRoot, "SKILL.md"), "---\nname: niucodes-image-gen\ndescription: test\n---\n");
+  await writeFile(path.join(sourceRoot, "config.json"), '{"apiKey":"template-key"}');
+  await writeFile(path.join(sourceRoot, "bin", "niucodes-image-gen-macos-arm64"), "binary");
+  await mkdir(installDir, { recursive: true });
+  await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved-key"}');
 
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer test-key$/);
-      assert.match(req.headers["content-type"], /^application\/json/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.model, "gpt-image-2");
-      assert.equal(parsed.prompt, "paint a tiny blue fox");
-      assert.equal(parsed.output_format, "png");
-      assert.equal(parsed.size, DEFAULT_GENERATE_SIZE);
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [
-            {
-              b64_json: fixturePngBase64,
-              revised_prompt: "paint a tiny blue fox",
-            },
-          ],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await execFileAsync(process.execPath, [
-        scriptPath,
-        "generate",
-        "--prompt",
-        "paint a tiny blue fox",
-        "--api-key",
-        "test-key",
-        "--base-url",
-        `${baseURL}/v1`,
-        "--output",
-        outputPath,
-      ]);
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.ok, true);
-      assert.equal(result.command, "generate");
-      assert.equal(result.size, DEFAULT_GENERATE_SIZE);
-      assert.equal("request" in result, false);
-      assert.equal(result.saved.length, 1);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-      assert.match(result.saved[0].markdown, /^!\[generate-1\]\(\/[A-Z]:\//i);
-      const savedBytes = await readFile(outputPath);
-      assert.equal(savedBytes.toString("base64"), fixturePngBase64);
-    },
-  );
+  const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
+  assert.equal(result.status, "success");
+  assert.equal(result.command, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved-key"}');
+  const codexConfig = await readFile(configPath, "utf8");
+  assert.match(codexConfig, /\[mcp_servers\.niucodes_image_gen\]/);
+  assert.match(codexConfig, /args = \["mcp"\]/);
 });
 
-test("edit command uses multipart uploads for multiple images and mask", async () => {
+test("MCP server handles generate and edit as single structured calls", async () => {
   const tempDir = await createTempDir();
-  const imageOne = path.join(tempDir, "inputs", "image-1.png");
-  const imageTwo = path.join(tempDir, "inputs", "image-2.png");
-  const maskPath = path.join(tempDir, "inputs", "mask.png");
-  const outputPath = path.join(tempDir, "edited.webp");
+  const skillRoot = path.join(tempDir, "skill root");
+  const outputDir = path.join(tempDir, "output files");
+  const sourceImage = path.join(tempDir, "source image.png");
+  await mkdir(skillRoot, { recursive: true });
+  await writePng(sourceImage);
+  const requests = [];
+  await withMockServer(async (req, res, body) => {
+    requests.push({ url: req.url, body: body.toString("utf8") });
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "mcp-test-key", baseURL, quality: "low" }));
+    const client = await startMcpClient({ skillRoot });
+    const initialized = await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
+    assert.equal(initialized.result.protocolVersion, "2024-11-05");
+    const tools = await client.request("tools/list");
+    assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["imagegen_generate", "imagegen_edit"]);
 
-  await writePng(imageOne);
-  await writePng(imageTwo);
-  await writePng(maskPath);
+    const generatedPath = path.join(outputDir, "generated.png");
+    const generated = await client.request("tools/call", {
+      name: "imagegen_generate",
+      arguments: { prompt: "中文 prompt with spaces and \"quotes\"", output: generatedPath, quality: "low" },
+    });
+    const generatedResult = generated.result.structuredContent;
+    assert.equal(generated.result.isError, false);
+    assert.equal(generatedResult.status, "success");
+    assert.equal(generatedResult.saved[0].absolute_path, generatedPath);
+    assert.equal(generatedResult.model, undefined);
+    assert.equal(generatedResult.base_url, undefined);
+    assert.equal(typeof generatedResult.timing_ms.non_api, "number");
+    assert.equal(typeof generatedResult.timing_ms.mcp.total, "number");
 
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/edits");
-      assert.match(req.headers["authorization"], /^Bearer edit-key$/);
-      assert.match(req.headers["content-type"], /^multipart\/form-data;/);
-
-      const parts = parseMultipart(body, req.headers["content-type"]);
-      const imageParts = parts.filter((part) => part.name === "image[]" || part.name === "image");
-      assert.equal(imageParts.length, 2);
-      assert.deepEqual(
-        imageParts.map((part) => part.filename),
-        ["image-1.png", "image-2.png"],
-      );
-      const maskParts = parts.filter((part) => part.name === "mask");
-      assert.equal(maskParts.length, 1);
-      assert.equal(maskParts[0].filename, "mask.png");
-      assert.equal(
-        parts.find((part) => part.name === "model")?.body,
-        "gpt-image-1",
-      );
-      assert.equal(
-        parts.find((part) => part.name === "prompt")?.body,
-        "replace the center with a glowing lantern",
-      );
-      assert.equal(parts.find((part) => part.name === "output_format")?.body, "webp");
-      assert.equal(parts.find((part) => part.name === "quality")?.body, "low");
-      assert.equal(parts.find((part) => part.name === "size")?.body, "1024x1024");
-
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [
-            {
-              b64_json: fixturePngBase64,
-            },
-          ],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await execFileAsync(process.execPath, [
-        scriptPath,
-        "edit",
-        "--image",
-        imageOne,
-        "--image",
-        imageTwo,
-        "--mask",
-        maskPath,
-        "--prompt",
-        "replace the center with a glowing lantern",
-        "--api-key",
-        "edit-key",
-        "--base-url",
-        `${baseURL}/v1`,
-        "--model",
-        "gpt-image-1",
-        "--output",
-        outputPath,
-        "--output-format",
-        "webp",
-        "--quality",
-        "low",
-        "--size",
-        "1024x1024",
-        "--verbose-response",
-      ]);
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.ok, true);
-      assert.equal(result.command, "edit");
-      assert.equal(result.request.image_count, 2);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-      const savedBytes = await readFile(outputPath);
-      assert.equal(savedBytes.toString("base64"), fixturePngBase64);
-    },
-  );
+    const editedPath = path.join(outputDir, "edited.png");
+    const edited = await client.request("tools/call", {
+      name: "imagegen_edit",
+      arguments: { prompt: "将人物改为男性", output: editedPath, images: [sourceImage], quality: "low" },
+    });
+    assert.equal(edited.result.isError, false);
+    assert.equal(edited.result.structuredContent.status, "success");
+    assert.equal(edited.result.structuredContent.saved[0].absolute_path, editedPath);
+    assert.equal(await client.close(), "");
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(JSON.parse(requests[0].body).prompt, "中文 prompt with spaces and \"quotes\"");
+  assert.equal(requests[1].url, "/v1/images/edits");
+  assert.match(requests[1].body, /将人物改为男性/);
 });
 
-test("config file works and CLI overrides config values", async () => {
+test("Apple Silicon executable serves MCP generate and edit directly", { skip: process.platform !== "darwin" }, async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "native skill");
+  const outputDir = path.join(tempDir, "native output");
+  const sourceImage = path.join(tempDir, "native source.png");
+  await mkdir(path.join(skillRoot, "bin"), { recursive: true });
+  await (await import("node:fs/promises")).copyFile(macosArm64BinaryPath, path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64"));
+  await writePng(sourceImage);
+  await withMockServer(async (req, res, body) => {
+    assert.ok(["/v1/images/generations", "/v1/images/edits"].includes(req.url));
+    assert.match(body.toString("utf8"), /原样中文|覆盖已有输出/);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "native-mcp-key", baseURL, quality: "low" }));
+    const client = await startMcpClient({
+      skillRoot,
+      executable: path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64"),
+      executableArgs: ["mcp"],
+    });
+    await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
+    const generated = await client.request("tools/call", {
+      name: "imagegen_generate",
+      arguments: { prompt: "原样中文 generate", output: path.join(outputDir, "generated.png") },
+    });
+    assert.equal(generated.result.structuredContent.status, "success");
+    assert.equal(generated.result.structuredContent.saved[0].absolute_path, path.join(outputDir, "generated.png"));
+    assert.equal(generated.result.structuredContent.render, `![generate-1](${path.join(outputDir, "generated.png")})`);
+    assert.equal(generated.result.content[0].text, generated.result.structuredContent.final_answer);
+    await writeFile(path.join(outputDir, "generated.png"), "previous output");
+    const overwritten = await client.request("tools/call", {
+      name: "imagegen_generate",
+      arguments: { prompt: "覆盖已有输出", output: path.join(outputDir, "generated.png") },
+    });
+    assert.equal(overwritten.result.structuredContent.saved[0].absolute_path, path.join(outputDir, "generated.png"));
+    assert.deepEqual(await readFile(path.join(outputDir, "generated.png")), Buffer.from(fixturePngBase64, "base64"));
+    const edited = await client.request("tools/call", {
+      name: "imagegen_edit",
+      arguments: { prompt: "原样中文 edit", output: path.join(outputDir, "edited.png"), images: [sourceImage] },
+    });
+    assert.equal(edited.result.structuredContent.status, "success");
+    assert.equal(await client.close(), "");
+  });
+});
+
+test("Apple Silicon installer installs a native MCP package without overwriting config", { skip: process.platform !== "darwin" }, async () => {
+  const tempDir = await createTempDir();
+  const installDir = path.join(tempDir, "installed skill");
+  const configPath = path.join(tempDir, "codex config", "config.toml");
+  await mkdir(installDir, { recursive: true });
+  await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved"}');
+
+  const { stdout, stderr } = await execFileAsync(macosArm64BinaryPath, [
+    "install", "--install-dir", installDir, "--config-path", configPath,
+  ]);
+  const result = JSON.parse(stdout);
+  assert.equal(stderr, "");
+  assert.equal(result.status, "success");
+  assert.equal(result.command, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved"}');
+  assert.match(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
+});
+
+test("macOS runner waits locally and emits one final status JSON", { skip: process.platform !== "darwin" }, async () => {
+  const tempDir = await createTempDir();
+  const statusPath = path.join(tempDir, "status with spaces.json");
+  const mockExecutable = path.join(tempDir, "mock image binary.sh");
+  await writeFile(mockExecutable, `#!/bin/bash
+status_file=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--status-file" ]; then status_file="$2"; shift 2; else shift; fi
+done
+printf '%s\\n' '{"status":"running","command":"generate","exit_code":null,"saved":[],"timing_ms":{},"error":null,"request_id":null}' > "$status_file"
+sleep 0.05
+printf '%s\\n' '{"status":"success","command":"generate","exit_code":0,"saved":[{"absolute_path":"/tmp/output image.png"}],"timing_ms":{"input_prepare":0,"api":50,"save":0,"total":50},"error":null,"request_id":"mock-request"}' > "$status_file"
+printf '%s\\n' 'child stdout must not be forwarded'
+`);
+  await (await import("node:fs/promises")).chmod(mockExecutable, 0o755);
+
+  const { stdout, stderr } = await execFileAsync("/bin/bash", [
+    macosRunnerPath,
+    "generate",
+    "--status-file", statusPath,
+    "--timeout-seconds", "5",
+    "--executable-path", mockExecutable,
+    "--prompt", "中文 prompt with spaces and \\\"quotes\\\"",
+    "--output", path.join(tempDir, "output image.png"),
+  ]);
+  assert.equal(stderr, "");
+  const result = JSON.parse(stdout);
+  assert.equal(result.status, "success");
+  assert.equal(result.exit_code, 0);
+  assert.equal(result.request_id, "mock-request");
+  assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+  assert.doesNotMatch(stdout, /child stdout/);
+});
+
+test("macOS runner preserves failed and timeout result contracts", { skip: process.platform !== "darwin" }, async () => {
+  const tempDir = await createTempDir();
+  const failedStatusPath = path.join(tempDir, "failed.status.json");
+  const failedExecutable = path.join(tempDir, "failed binary.sh");
+  await writeFile(failedExecutable, `#!/bin/bash
+while [ "$1" != "--status-file" ]; do shift; done
+printf '%s\\n' '{"status":"failed","command":"edit","exit_code":1,"saved":[],"timing_ms":{"total":7},"error":{"message":"mock failure"},"request_id":null}' > "$2"
+exit 1
+`);
+  await (await import("node:fs/promises")).chmod(failedExecutable, 0o755);
+
+  await assert.rejects(
+    execFileAsync("/bin/bash", [macosRunnerPath, "edit", "--status-file", failedStatusPath, "--executable-path", failedExecutable]),
+    (error) => {
+      const result = JSON.parse(error.stdout);
+      assert.equal(error.code, 1);
+      assert.equal(result.status, "failed");
+      assert.equal(result.error.message, "mock failure", JSON.stringify(result));
+      return true;
+    },
+  );
+
+  const timeoutStatusPath = path.join(tempDir, "timeout.status.json");
+  const timeoutExecutable = path.join(tempDir, "slow binary.sh");
+  await writeFile(timeoutExecutable, `#!/bin/bash
+while [ "$1" != "--status-file" ]; do shift; done
+printf '%s\\n' '{"status":"running","command":"generate","exit_code":null,"saved":[],"timing_ms":{},"error":null,"request_id":null}' > "$2"
+sleep 10
+`);
+  await (await import("node:fs/promises")).chmod(timeoutExecutable, 0o755);
+
+  let timeoutError;
+  try {
+    await execFileAsync("/bin/bash", [macosRunnerPath, "generate", "--status-file", timeoutStatusPath, "--timeout-seconds", "1", "--executable-path", timeoutExecutable]);
+  } catch (error) {
+    timeoutError = error;
+  }
+  assert.ok(timeoutError);
+  const timeoutResult = JSON.parse(timeoutError.stdout);
+  assert.equal(timeoutError.code, 124);
+  assert.equal(timeoutResult.status, "failed");
+  assert.equal(timeoutResult.exit_code, 124);
+  assert.match(timeoutResult.error.message, /Timed out/);
+  assert.deepEqual(JSON.parse(await readFile(timeoutStatusPath, "utf8")), timeoutResult);
+});
+
+test("generate forwards prompt verbatim and reads the key only from config.json", async () => {
   const tempDir = await createTempDir();
   const configPath = path.join(tempDir, "config.json");
-  const outputDir = `${path.join(tempDir, "outputs")}${path.sep}`;
-
-  await writeFile(
-    configPath,
-    JSON.stringify(
-      {
-        apiKey: "config-key",
-        baseURL: "http://127.0.0.1:1/v1",
-        model: "gpt-image-1",
-        quality: "high",
-        output: outputDir,
-      },
-      null,
-      2,
-    ),
-  );
-
-  await withMockServer(
-    async (req, res, body) => {
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.model, "gpt-image-2");
-      assert.equal(parsed.quality, "medium");
-      assert.match(req.headers["authorization"], /^Bearer config-key$/);
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout } = await execFileAsync(process.execPath, [
-        scriptPath,
-        "generate",
-        "--config",
-        configPath,
-        "--prompt",
-        "paint a red kite",
-        "--base-url",
-        `${baseURL}/v1`,
-        "--model",
-        "gpt-image-2",
-        "--quality",
-        "medium",
-      ]);
-
-      const result = JSON.parse(stdout);
-      assert.equal(result.model, "gpt-image-2");
-      assert.equal(result.quality, "medium");
-      assert.equal(result.saved.length, 1);
-      assert.match(result.saved[0].absolute_path, /image-outputs|outputs/i);
-    },
-  );
-});
-
-test("resolveInvocation defaults to api-direct base URL and reuses auth.json key for claudecodes.org subdomain provider matching", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "api",
-      openai_api_key: "auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_subdomain",
-      baseURL: "https://api-direct.claudecodes.org/v1/",
-      experimentalBearerToken: "provider-key",
-    }),
+  const outputPath = path.join(tempDir, "generated.png");
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.url, "/v1/images/generations");
+    assert.equal(req.headers.authorization, "Bearer config-key");
+    const payload = JSON.parse(body);
+    assert.equal(payload.prompt, "  Use EXACT wording: teal cube / 1990s film.  ");
+    assert.equal(payload.size, DEFAULT_GENERATE_SIZE);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(configPath, JSON.stringify({ apiKey: "config-key", baseURL }));
+    const { stdout } = await execFileAsync(process.execPath, [
+      scriptPath, "generate", "--config", configPath, "--prompt", "  Use EXACT wording: teal cube / 1990s film.  ", "--output", outputPath,
+    ]);
+    const result = JSON.parse(stdout);
+    assert.equal(result.status, "success");
+    assert.equal(result.exit_code, 0);
+    assert.equal(result.error, null);
+    assert.deepEqual(
+      Object.keys(result).filter((key) => ["status", "command", "exit_code", "saved", "timing_ms", "error", "request_id"].includes(key)).sort(),
+      ["command", "error", "exit_code", "request_id", "saved", "status", "timing_ms"],
+    );
+    assert.equal(result.saved[0].absolute_path, outputPath);
+    assert.equal(typeof result.timing_ms.api, "number");
+    assert.equal(typeof result.timing_ms.save, "number");
+    assert.equal(typeof result.timing_ms.total, "number");
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
   });
-
-  const invocation = await resolveInvocation(
-    "generate",
-    {
-      prompt: "draw a lantern festival",
-      image: [],
-    },
-    {
-      cwd: repoRoot,
-      env: {
-        CODEX_HOME: codexHome,
-        USERPROFILE: tempDir,
-        HOME: tempDir,
-        OPENAI_API_KEY: "",
-      },
-    },
-  );
-
-  assert.equal(invocation.apiKey, "auth-json-key");
-  assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
-  assert.equal(invocation.size, DEFAULT_GENERATE_SIZE);
 });
 
-test("resolveInvocation reuses provider experimental token for niucodes.com subdomain provider matching", async () => {
+test("generate publishes a running then successful atomic status after a delayed API response", async () => {
   const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "chatgpt",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "niucodes_subdomain",
-      baseURL: "https://img.niucodes.com/v1/",
-      experimentalBearerToken: "niucodes-subdomain-token",
-    }),
+  const configPath = path.join(tempDir, "config.json");
+  const outputPath = path.join(tempDir, "generated.png");
+  const statusPath = path.join(tempDir, "generated.status.json");
+  let notifyRequestStarted;
+  const requestStarted = new Promise((resolve) => { notifyRequestStarted = resolve; });
+  await withMockServer(async (_req, res) => {
+    notifyRequestStarted();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(configPath, JSON.stringify({ apiKey: "config-key", baseURL }));
+    const command = execFileAsync(process.execPath, [
+      scriptPath, "generate", "--config", configPath, "--prompt", "delayed image", "--output", outputPath, "--status-file", statusPath,
+    ]);
+    await requestStarted;
+    const running = JSON.parse(await readFile(statusPath, "utf8"));
+    assert.equal(running.status, "running");
+    assert.equal(running.command, "generate");
+    const { stdout } = await command;
+    const result = JSON.parse(stdout);
+    const complete = JSON.parse(await readFile(statusPath, "utf8"));
+    assert.equal(complete.status, "success");
+    assert.equal(complete.exit_code, 0);
+    assert.deepEqual(complete.saved.map((item) => item.absolute_path), [outputPath]);
+    assert.deepEqual(complete.timing_ms, result.timing_ms);
   });
-
-  const invocation = await resolveInvocation(
-    "generate",
-    {
-      prompt: "draw a lantern festival",
-      image: [],
-    },
-    {
-      cwd: repoRoot,
-      env: {
-        CODEX_HOME: codexHome,
-        USERPROFILE: tempDir,
-        HOME: tempDir,
-        OPENAI_API_KEY: "",
-      },
-    },
-  );
-
-  assert.equal(invocation.apiKey, "niucodes-subdomain-token");
-  assert.equal(invocation.baseURL, DEFAULT_BASE_URL);
 });
 
-test("resolveInvocation keeps edit size on auto by default", async () => {
+test("edit sends the configured SDK request as multipart", async () => {
   const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir);
-
-  const invocation = await resolveInvocation(
-    "edit",
-    {
-      prompt: "add a red scarf",
-      image: [path.join(repoRoot, "package.json")],
-      apiKey: "edit-default-key",
-    },
-    {
-      cwd: repoRoot,
-      env: {
-        CODEX_HOME: codexHome,
-        USERPROFILE: tempDir,
-        HOME: tempDir,
-        OPENAI_API_KEY: "",
-      },
-    },
-  );
-
-  assert.equal(invocation.size, DEFAULT_EDIT_SIZE);
-});
-
-test("CLI auto-discovers auth.json API key for API login with matching provider base_url", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "api",
-      OPENAI_API_KEY: "api-mode-auth-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_org",
-      baseURL: "https://claudecodes.org/v1/",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
+  const configPath = path.join(tempDir, "config.json");
+  const imagePath = path.join(tempDir, "source.png");
+  const outputPath = path.join(tempDir, "edited.webp");
+  await writePng(imagePath);
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.url, "/v1/images/edits");
+    assert.equal(req.headers.authorization, "Bearer edit-key");
+    assert.match(req.headers["content-type"], /^multipart\/form-data/);
+    assert.match(body.toString("latin1"), /replace subject with a polished chrome vase/);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(configPath, JSON.stringify({ apiKey: "edit-key", baseURL, model: "gpt-image-1", quality: "low", outputFormat: "webp" }));
+    const statusPath = path.join(tempDir, "edited.status.json");
+    const { stdout } = await execFileAsync(process.execPath, [
+      scriptPath, "edit", "--config", configPath, "--image", imagePath, "--prompt", "replace subject with a polished chrome vase", "--output", outputPath, "--status-file", statusPath,
+    ]);
+    const result = JSON.parse(stdout);
+    const status = JSON.parse(await readFile(statusPath, "utf8"));
+    assert.equal(status.status, "success");
+    assert.equal(status.command, "edit");
+    assert.equal(status.exit_code, 0);
+    assert.equal(typeof result.timing_ms.input_prepare, "number");
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
   });
-  const outputPath = path.join(tempDir, "api-mode-generate.png");
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer api-mode-auth-key$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a paper crane");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a paper crane",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.base_url, `${baseURL}/v1`);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
 });
 
-test("CLI auto-discovers auth.json API key for API login with niucodes.com exact provider base_url", async () => {
+test("failed edit records a final status without exposing credentials", async () => {
   const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "api",
-      OPENAI_API_KEY: "api-mode-niucodes-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "niucodes_org",
-      baseURL: "https://niucodes.com/v1/",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
-  });
-  const outputPath = path.join(tempDir, "api-mode-niucodes.png");
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer api-mode-niucodes-key$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a folded boat");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a folded boat",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.base_url, `${baseURL}/v1`);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
-});
-
-test("CLI auto-discovers selected provider experimental_bearer_token for account login with matching provider base_url", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "chatgpt",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "niucodes_org",
-      baseURL: "https://niucodes.com/v1",
-      experimentalBearerToken: "provider-fallback-key",
-    }),
-  });
-  const outputPath = path.join(tempDir, "provider-fallback.png");
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer provider-fallback-key$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a paper lantern");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a paper lantern",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.base_url, `${baseURL}/v1`);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
-});
-
-test("CLI auto-discovers selected provider experimental_bearer_token for account login with claudecodes.org subdomain provider base_url", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "chatgpt",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "claudecodes_subdomain",
-      baseURL: "https://api-direct.claudecodes.org/v1",
-      experimentalBearerToken: "claudecodes-subdomain-token",
-    }),
-  });
-  const outputPath = path.join(tempDir, "claudecodes-subdomain.png");
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer claudecodes-subdomain-token$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a folded crane");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a folded crane",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.base_url, `${baseURL}/v1`);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
-});
-
-test("CLI asks for a key when API login provider does not match and no stored key exists", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "api",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "other_provider",
-      baseURL: "https://example.com/v1",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
-  });
-  const skillDir = await createTempSkillDir();
-
-  const error = await captureCliFailure(
-    [
-      "generate",
-      "--prompt",
-      "paint a cedar forest",
-    ],
-    {
-      env: {
-        CODEX_HOME: codexHome,
-        USERPROFILE: tempDir,
-        HOME: tempDir,
-        OPENAI_API_KEY: "",
-        NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
-      },
-    },
-  );
-
-  assert.match(error.stderr ?? error.message, /Missing API key/);
-  assert.match(error.stderr ?? error.message, /set-skill-api-key\.mjs/);
-});
-
-test("CLI asks for a key when account login provider does not match and no stored key exists", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "chatgpt",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "other_provider",
-      baseURL: "https://example.com/v1",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
-  });
-  const skillDir = await createTempSkillDir();
-
-  const error = await captureCliFailure(
-    [
-      "generate",
-      "--prompt",
-      "paint a cedar forest",
-    ],
-    {
-      env: {
-        CODEX_HOME: codexHome,
-        USERPROFILE: tempDir,
-        HOME: tempDir,
-        OPENAI_API_KEY: "",
-        NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
-      },
-    },
-  );
-
-  assert.match(error.stderr ?? error.message, /Missing API key/);
-  assert.match(error.stderr ?? error.message, /set-skill-api-key\.mjs/);
-});
-
-test("set-skill-api-key script writes the first body line and extractor reads it back", async () => {
-  const skillDir = await createTempSkillDir();
-
-  const { stdout, stderr } = await execFileAsync(process.execPath, [
-    setterScriptPath,
-    "--skill-dir",
-    skillDir,
-    "--api-key",
-    "stored-test-key",
-  ]);
-
-  assert.equal(stderr, "");
-  assert.match(stdout, /Stored API key in .*SKILL\.md/);
-
-  const updatedSkillContent = await readFile(path.join(skillDir, "SKILL.md"), "utf8");
-  assert.match(
-    updatedSkillContent,
-    /^---\r?\n[\s\S]*?\r?\n---\r?\nAPI_KEY: stored-test-key\r?\n/m,
-  );
-  assert.equal(extractStoredSkillApiKey(updatedSkillContent), "stored-test-key");
-});
-
-test("CLI falls back to stored SKILL.md API key for unsupported API-login scenarios", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "api",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "other_provider",
-      baseURL: "https://example.com/v1",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
-  });
-  const skillDir = await createTempSkillDir();
-  const outputPath = path.join(tempDir, "stored-api-login.png");
-
-  await execFileAsync(process.execPath, [
-    setterScriptPath,
-    "--skill-dir",
-    skillDir,
-    "--api-key",
-    "stored-skill-key-api",
-  ]);
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer stored-skill-key-api$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a green badge");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a green badge",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-            NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
-});
-
-test("CLI falls back to stored SKILL.md API key for unsupported account-login scenarios", async () => {
-  const tempDir = await createTempDir();
-  const codexHome = await createCodexHome(tempDir, {
-    authJson: {
-      auth_mode: "chatgpt",
-      OPENAI_API_KEY: "ignored-auth-json-key",
-    },
-    configToml: buildProviderConfigToml({
-      modelProvider: "other_provider",
-      baseURL: "https://example.com/v1",
-      experimentalBearerToken: "ignored-provider-token",
-    }),
-  });
-  const skillDir = await createTempSkillDir();
-  const outputPath = path.join(tempDir, "stored-account-login.png");
-
-  await execFileAsync(process.execPath, [
-    setterScriptPath,
-    "--skill-dir",
-    skillDir,
-    "--api-key",
-    "stored-skill-key-account",
-  ]);
-
-  await withMockServer(
-    async (req, res, body) => {
-      assert.equal(req.method, "POST");
-      assert.equal(req.url, "/v1/images/generations");
-      assert.match(req.headers["authorization"], /^Bearer stored-skill-key-account$/);
-      const parsed = JSON.parse(body.toString("utf8"));
-      assert.equal(parsed.prompt, "paint a silver badge");
-      res.statusCode = 200;
-      res.setHeader("content-type", "application/json");
-      res.end(
-        JSON.stringify({
-          data: [{ b64_json: fixturePngBase64 }],
-        }),
-      );
-    },
-    async ({ baseURL }) => {
-      const { stdout, stderr } = await runCli(
-        [
-          "generate",
-          "--prompt",
-          "paint a silver badge",
-          "--output",
-          outputPath,
-        ],
-        {
-          env: {
-            CODEX_HOME: codexHome,
-            USERPROFILE: tempDir,
-            HOME: tempDir,
-            OPENAI_API_KEY: "",
-            OPENAI_BASE_URL: `${baseURL}/v1`,
-            NIUCODES_IMAGE_GEN_SKILL_DIR: skillDir,
-          },
-        },
-      );
-
-      assert.equal(stderr, "");
-      const result = JSON.parse(stdout);
-      assert.equal(result.saved[0].absolute_path, outputPath);
-    },
-  );
-});
-
-test("gpt-image-2 rejects unsupported input-fidelity before any network call", async () => {
-  await assert.rejects(
-    () =>
-      runCli([
-        "edit",
-        "--image",
-        path.join(repoRoot, "package.json"),
-        "--prompt",
-        "turn this into an illustration",
-        "--api-key",
-        "test-key",
-        "--input-fidelity",
-        "high",
+  const configPath = path.join(tempDir, "config.json");
+  const imagePath = path.join(tempDir, "source.png");
+  const outputPath = path.join(tempDir, "edited.png");
+  const statusPath = path.join(tempDir, "edited.status.json");
+  await writePng(imagePath);
+  await withMockServer(async (_req, res) => {
+    res.statusCode = 500;
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ error: { message: "mock edit failed" } }));
+  }, async (baseURL) => {
+    await writeFile(configPath, JSON.stringify({ apiKey: "sensitive-key", baseURL }));
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        scriptPath, "edit", "--config", configPath, "--image", imagePath, "--prompt", "fail", "--output", outputPath, "--status-file", statusPath,
       ]),
-    /gpt-image-2 requires omitting inputFidelity/,
+    );
+    const status = JSON.parse(await readFile(statusPath, "utf8"));
+    assert.equal(status.status, "failed");
+    assert.equal(status.command, "edit");
+    assert.equal(status.exit_code, 1);
+    assert.equal(typeof status.error.message, "string");
+    assert.doesNotMatch(JSON.stringify(status), /sensitive-key/);
+  });
+});
+
+test("Apple Silicon executable performs an edit upload end to end", { skip: process.platform !== "darwin" }, async () => {
+  const tempDir = await createTempDir();
+  const configPath = path.join(tempDir, "config.json");
+  const imagePath = path.join(tempDir, "source.png");
+  const outputPath = path.join(tempDir, "edited.png");
+  await writePng(imagePath);
+
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.method, "POST");
+    assert.equal(req.url, "/v1/images/edits");
+    assert.equal(req.headers.authorization, "Bearer binary-test-key");
+    assert.match(req.headers["content-type"], /^multipart\/form-data/);
+    assert.match(body.toString("latin1"), /make the vase blue/);
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(configPath, JSON.stringify({ apiKey: "binary-test-key", baseURL }));
+    const { stdout, stderr } = await execFileAsync(macosArm64BinaryPath, [
+      "edit", "--config", configPath, "--image", imagePath, "--prompt", "make the vase blue", "--output", outputPath,
+    ]);
+    assert.equal(stderr, "");
+    assert.equal(JSON.parse(stdout).status, "success");
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+  });
+});
+
+test("config defaults are retained and API key flags are rejected", async () => {
+  const tempDir = await createTempDir();
+  const configPath = path.join(tempDir, "config.json");
+  await writeFile(configPath, JSON.stringify({ apiKey: "config-key" }));
+  const invocation = await resolveInvocation("edit", {
+    config: configPath,
+    prompt: "add a scarf",
+    output: path.join(tempDir, "edited.png"),
+    image: [path.join(repoRoot, "package.json")],
+  }, { cwd: repoRoot });
+  assert.equal(invocation.apiKey, "config-key");
+  assert.equal(invocation.size, DEFAULT_EDIT_SIZE);
+  await assert.rejects(
+    execFileAsync(process.execPath, [scriptPath, "generate", "--config", configPath, "--api-key", "ignored", "--prompt", "a test"]),
+    /--api-key is not supported/,
   );
+});
+
+test("requires an explicit output location outside the skill directory", async () => {
+  const tempDir = await createTempDir();
+  const configPath = path.join(tempDir, "config.json");
+  await writeFile(configPath, JSON.stringify({ apiKey: "config-key" }));
+
+  await assert.rejects(
+    resolveInvocation("generate", { config: configPath, prompt: "a test", image: [] }, { cwd: repoRoot }),
+    /Missing output directory/,
+  );
+  await assert.rejects(
+    resolveInvocation("generate", {
+      config: configPath,
+      prompt: "a test",
+      output: path.join(repoRoot, "image-outputs"),
+      image: [],
+    }, { cwd: repoRoot }),
+    /outside the skill directory/,
+  );
+
+  const invocation = await resolveInvocation("generate", {
+    config: configPath,
+    prompt: "a test",
+    output: path.join(tempDir, "images"),
+    image: [],
+  }, { cwd: repoRoot });
+  assert.equal(invocation.output, path.join(tempDir, "images"));
 });

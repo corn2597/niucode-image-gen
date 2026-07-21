@@ -1,6 +1,17 @@
 node_modules/
+.npm-cache/
+build/
 image-outputs/
 scripts/tests/tmp/
 tmp/
 *.local.json
 .DS_Store
+release/*.zip
+release/niucodes-image-gen/
+release/niucodes-image-gen-macos-arm64/
+release/niucodes-image-gen-macos-x64/
+release/niucodes-image-gen-win-x64/
+bin/niucodes-image-gen-installer-*
+bin/niucodes-image-gen-macos-arm64
+bin/niucodes-image-gen-macos-x64
+bin/niucodes-image-gen-win-x64.exe

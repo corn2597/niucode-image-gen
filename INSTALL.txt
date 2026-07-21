@@ -1,0 +1,11 @@
+NiuCodes Image Gen installation
+
+1. Edit config.json and enter your API key.
+2. Run the installer for your platform:
+   - Apple Silicon Mac: scripts/install-macos-arm64.command
+   - Intel Mac: scripts/install-macos-x64.command
+   - Windows x64: scripts/install-windows.cmd
+3. Restart Codex Desktop.
+
+No Node.js, Python, PowerShell, or OpenAI SDK installation is required.
+The installer creates ~/.codex/skills/niucodes-image-gen and configures the local MCP server.

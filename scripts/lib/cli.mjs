@@ -1,4 +1,5 @@
-import { stat } from "node:fs/promises";
+import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
 import process from "node:process";
 
 import {
@@ -19,24 +20,19 @@ import {
 const HELP_TEXT = `niucodes-image-gen
 
 Usage:
-  node <skill-dir>/scripts/niucodes-image-gen.mjs generate --prompt "..." [--api-key "<key>"] [options]
-  node <skill-dir>/scripts/niucodes-image-gen.mjs edit --image "<path>" --prompt "..." [--api-key "<key>"] [options]
+  niucodes-image-gen generate --prompt "..." [options]
+  niucodes-image-gen edit --image "<path>" --prompt "..." [options]
 
 Commands:
   generate    Call /v1/images/generations through the official OpenAI Node SDK.
   edit        Call /v1/images/edits through the official OpenAI Node SDK.
 
 Common options:
-  --config <path>               Load JSON config. CLI flags override config values.
-  --api-key <key>               API key. Otherwise use OPENAI_API_KEY, config apiKey,
-                                Codex API login + provider hostname suffix
-                                claudecodes.org or niucodes.com -> auth.json openai_api_key,
-                                Codex account login + selected model_provider hostname suffix
-                                claudecodes.org or niucodes.com -> experimental_bearer_token,
-                                or the stored first-body-line API_KEY in SKILL.md.
+  --config <path>               JSON config path. Defaults to <skill-dir>/config.json.
+                                apiKey is read only from this config file.
   --base-url <url>              SDK baseURL. Defaults to ${DEFAULT_BASE_URL}.
-  --model <model>               Defaults to gpt-image-2 or OPENAI_IMAGE_MODEL.
-  --output <file-or-dir>        Output file or directory. Defaults to ./image-outputs/.
+  --model <model>               Defaults to gpt-image-2.
+  --output <file-or-dir>        Required. Output file or directory outside the skill directory.
   --output-format <fmt>         png | jpeg | webp
   --quality <value>             auto | low | medium | high
   --size <value>                Supported size. Defaults to ${DEFAULT_GENERATE_SIZE} for generate
@@ -46,6 +42,7 @@ Common options:
   --n <count>                   Number of images to save. Default: 1
   --overwrite                   Overwrite the first output path if it already exists.
   --timeout-ms <ms>             SDK timeout in milliseconds. Default: 180000
+  --status-file <path>          Optional JSON lifecycle file. Written atomically after each state change.
   --verbose-response            Include expanded request/response metadata in the JSON output.
 
 Edit-only options:
@@ -57,10 +54,6 @@ Display rule:
   The script prints compact JSON by default. Reuse saved[*].markdown in the final answer so Codex,
   VS Code surfaces, and similar clients can render the saved local image files.
 
-Missing-key recovery:
-  When auto-discovery does not apply, ask the user for a valid API key in chat and persist it with
-  node <skill-dir>/scripts/set-skill-api-key.mjs --api-key "<key>" instead of asking the user to
-  edit SKILL.md or Codex config files manually.
 `;
 
 function parseArgumentValue(rawValue) {
@@ -148,18 +141,21 @@ async function fileExists(filePath) {
   }
 }
 
-function buildResponse(invocation, targets, savedItems, apiResponse, verboseResponse) {
+function buildResponse(invocation, targets, savedItems, apiResponse, verboseResponse, timing) {
   const renderables = buildRenderables(savedItems, invocation.command);
   const payload = {
-    ok: true,
+    status: "success",
     command: invocation.command,
+    exit_code: 0,
+    saved: renderables,
+    timing_ms: timing,
+    error: null,
+    request_id: apiResponse?._request_id ?? null,
     model: invocation.model,
     base_url: invocation.baseURL ?? DEFAULT_BASE_URL,
     size: invocation.size,
     quality: invocation.quality,
     output_format: invocation.outputFormat,
-    saved: renderables,
-    request_id: apiResponse?._request_id ?? null,
     revised_prompt: apiResponse?.data?.[0]?.revised_prompt ?? null,
   };
 
@@ -210,22 +206,81 @@ function resolveVerboseResponse(rawValue) {
   return parseBooleanFlag(rawValue, false);
 }
 
-export async function runCli(argv, { cwd = process.cwd(), env = process.env } = {}) {
-  const parsed = parseArgs(argv);
-  if (parsed.help) {
-    process.stdout.write(`${HELP_TEXT}\n`);
-    return 0;
+function writeToStream(stream, value) {
+  return new Promise((resolve, reject) => {
+    stream.write(value, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function writeStdout(value) {
+  return writeToStream(process.stdout, value);
+}
+
+function writeStderr(value) {
+  return writeToStream(process.stderr, value);
+}
+
+function resolveStatusFile(statusFile, cwd) {
+  if (statusFile === undefined || statusFile === null || statusFile === true || statusFile === "") return undefined;
+  return path.resolve(cwd, String(statusFile));
+}
+
+async function writeStatusFile(statusFile, payload) {
+  if (!statusFile) return;
+  await mkdir(path.dirname(statusFile), { recursive: true });
+  const temporaryPath = `${statusFile}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporaryPath, `${stableStringify(payload)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, statusFile);
+}
+
+function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, exitCode = null, stage }) {
+  return {
+    version: 1,
+    command,
+    status,
+    exit_code: exitCode,
+    started_at: startedAt,
+    completed_at: status === "running" ? null : new Date().toISOString(),
+    saved,
+    timing_ms: timing,
+    error,
+    request_id: requestId,
+    ...(stage ? { stage } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
+export async function executeImageCommand(command, options, { cwd = process.cwd() } = {}) {
+  const cliStartedAt = performance.now();
+  const startedAt = new Date().toISOString();
+  if (!["generate", "edit"].includes(command)) {
+    throw new Error(`Unsupported command: ${command}`);
+  }
+  if (options.apiKey !== undefined) {
+    throw new Error("--api-key is not supported. Set apiKey in config.json.");
   }
 
-  if (!["generate", "edit"].includes(parsed.command)) {
-    throw new Error(`Unsupported command: ${parsed.command}`);
-  }
-
-  const verboseResponse = resolveVerboseResponse(parsed.options.verboseResponse);
-  const invocation = await resolveInvocation(parsed.command, parsed.options, { cwd, env });
+  const statusFile = resolveStatusFile(options.statusFile, cwd);
+  let invocation;
 
   try {
-    const apiResponse = await createImageRequest(invocation);
+    const verboseResponse = resolveVerboseResponse(options.verboseResponse);
+    const resolveStartedAt = performance.now();
+    invocation = await resolveInvocation(command, options, { cwd });
+    const resolveDurationMs = Math.round(performance.now() - resolveStartedAt);
+    await writeStatusFile(statusFile, lifecyclePayload({
+      command: invocation.command,
+      status: "running",
+      startedAt,
+      timing: { total: Math.round(performance.now() - cliStartedAt) },
+      exitCode: null,
+      stage: "request",
+    }));
+    const { response: apiResponse, inputPrepareMs, apiDurationMs } = await createImageRequest(invocation);
+    const outputStartedAt = performance.now();
     const outputTargets = await resolveOutputTargets({
       command: invocation.command,
       cwd,
@@ -235,27 +290,65 @@ export async function runCli(argv, { cwd = process.cwd(), env = process.env } = 
       overwrite: invocation.overwrite,
       count: Array.isArray(apiResponse?.data) && apiResponse.data.length > 0 ? apiResponse.data.length : invocation.n,
     });
+    const outputPrepareMs = Math.round(performance.now() - outputStartedAt);
 
+    const saveStartedAt = performance.now();
     const savedItems = await saveImageItems(apiResponse, outputTargets, invocation.timeoutMs);
+    const saveDurationMs = Math.round(performance.now() - saveStartedAt);
+    const totalMs = Math.round(performance.now() - cliStartedAt);
     const payload = buildResponse(
       invocation,
       outputTargets,
       savedItems,
       apiResponse,
       verboseResponse,
+      {
+        resolve: resolveDurationMs,
+        input_prepare: inputPrepareMs,
+        api: apiDurationMs,
+        output_prepare: outputPrepareMs,
+        save: saveDurationMs,
+        non_api: totalMs - apiDurationMs,
+        total: totalMs,
+      },
     );
 
-    process.stdout.write(`${stableStringify(payload)}\n`);
-    return 0;
+    await writeStatusFile(statusFile, { ...payload, version: 1, started_at: startedAt, completed_at: new Date().toISOString(), stage: "complete" });
+    return payload;
   } catch (error) {
-    if (invocation.output) {
+    try {
+      await writeStatusFile(statusFile, lifecyclePayload({
+        command: invocation?.command ?? command,
+        status: "failed",
+        startedAt,
+        timing: { total: Math.round(performance.now() - cliStartedAt) },
+        stage: invocation ? "request_or_save" : "initialization",
+        error: { message: formatOpenAIError(error) },
+        exitCode: 1,
+      }));
+    } catch (statusError) {
+      await writeStderr(`Unable to write status file: ${formatOpenAIError(statusError)}\n`);
+    }
+    if (invocation?.output) {
       const outputExists = await fileExists(invocation.output);
       if (outputExists) {
-        process.stderr.write(`Output target already exists: ${invocation.output}\n`);
+        await writeStderr(`Output target already exists: ${invocation.output}\n`);
       }
     }
     throw new Error(formatOpenAIError(error));
   }
+}
+
+export async function runCli(argv, { cwd = process.cwd() } = {}) {
+  const parsed = parseArgs(argv);
+  if (parsed.help) {
+    await writeStdout(`${HELP_TEXT}\n`);
+    return 0;
+  }
+
+  const payload = await executeImageCommand(parsed.command, parsed.options, { cwd });
+  await writeStdout(`${stableStringify(payload)}\n`);
+  return 0;
 }
 
 export { HELP_TEXT, parseArgs };

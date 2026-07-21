@@ -1,19 +1,32 @@
 {
   "name": "niucodes-image-gen",
-  "version": "0.1.0",
+  "version": "1.1.1",
   "private": true,
-  "description": "Cross-platform Codex skill project for OpenAI image generation and editing.",
+  "description": "Standalone OpenAI Images SDK wrapper for generation and editing.",
   "type": "module",
   "bin": {
     "niucodes-image-gen": "./scripts/niucodes-image-gen.mjs"
   },
-  "engines": {
-    "node": ">=20.0.0"
-  },
   "scripts": {
-    "test": "node --test scripts/tests/*.test.mjs"
+    "test": "node --test scripts/tests/*.test.mjs",
+    "test:windows-runner": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\tests\\invoke-imagegen.tests.ps1",
+    "bundle:bin:mac": "esbuild scripts/niucodes-image-gen.mjs --bundle --platform=node --format=cjs --target=node22 --outfile=build/niucodes-image-gen-mac.cjs",
+    "bundle:bin:win": "esbuild scripts/niucodes-image-gen.mjs --bundle --platform=node --format=cjs --target=node18 --outfile=build/niucodes-image-gen-win.cjs",
+    "build:bin:mac": "npm run bundle:bin:mac && pkg --compress GZip --targets node22-macos-arm64 --output bin/niucodes-image-gen-macos-arm64 build/niucodes-image-gen-mac.cjs && pkg --compress GZip --targets node22-macos-x64 --output bin/niucodes-image-gen-macos-x64 build/niucodes-image-gen-mac.cjs",
+    "build:bin:win": "npm run bundle:bin:win && pkg --compress None --public --no-bytecode --targets node18-win-x64 --output bin/niucodes-image-gen-win-x64.exe build/niucodes-image-gen-win.cjs",
+    "build:bin": "npm run build:bin:mac && npm run build:bin:win",
+    "build:release": "npm run build:bin && node scripts/create-release.mjs"
   },
   "dependencies": {
     "openai": "^6.44.0"
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^5.16.1",
+    "esbuild": "^0.25.0"
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/openai/**/*"
+    ]
   }
 }
