@@ -94,6 +94,7 @@ test("Windows runner atomically replaces status files without File.Replace", asy
   assert.match(runner, /"-output"\s*=\s*"--output"/);
   assert.match(runner, /\[string\]\$Prompt/);
   assert.match(runner, /Add-ImageOption \$normalizedImageArguments "prompt" \$Prompt/);
+  assert.match(runner, /\$null -eq \$Arguments -or \$Arguments\.Count -eq 0/);
 });
 
 test("legacy MCP config removal preserves unrelated server configuration", () => {

@@ -110,6 +110,8 @@ function New-FailureResult([string]$FailureCommand, [int]$ExitCode, [string]$Mes
 }
 
 function Normalize-ImageArguments([string[]]$Arguments) {
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) { return @() }
+
     # Accept common PowerShell spellings while preserving the native CLI contract.
     $aliases = @{
         "-prompt" = "--prompt"
@@ -139,6 +141,7 @@ function Normalize-ImageArguments([string[]]$Arguments) {
     }
 
     return @($Arguments | ForEach-Object {
+        if ($null -eq $_) { return }
         $alias = $aliases[$_.ToLowerInvariant()]
         if ($alias) { $alias } else { $_ }
     })
