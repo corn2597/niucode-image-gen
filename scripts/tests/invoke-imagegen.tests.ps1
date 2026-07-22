@@ -56,6 +56,19 @@ public static class MockImageGen {
     }
 }
 '@ -OutputAssembly $mockExecutable -OutputType ConsoleApplication
+$quotedRunnerHelper = Join-Path $tempRoot "invoke quoted runner.ps1"
+@'
+$ErrorActionPreference = "Stop"
+& $env:NIUCODES_IMAGEGEN_TEST_RUNNER generate `
+    -StatusFile $env:NIUCODES_IMAGEGEN_TEST_STATUS_FILE `
+    -TimeoutSeconds ([int]$env:NIUCODES_IMAGEGEN_TEST_TIMEOUT_SECONDS) `
+    -ExecutablePath $env:NIUCODES_IMAGEGEN_TEST_EXECUTABLE `
+    -Prompt $env:NIUCODES_IMAGEGEN_TEST_PROMPT `
+    -Output $env:NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE `
+    -Quality low `
+    -Size 1024x1024 `
+    -Overwrite true
+'@ | Set-Content -LiteralPath $quotedRunnerHelper -Encoding UTF8
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -66,7 +79,7 @@ function Has-ImageOption($Captured, [string]$Name) {
     return (($values -contains "--$Name") -or ($values -contains "-$Name"))
 }
 
-function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSingleDashAliases = $false) {
+function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSingleDashAliases = $false, [bool]$UseQuotedPrompt = $false) {
     $caseRoot = Join-Path $tempRoot ("case with spaces " + $Mode)
     [System.IO.Directory]::CreateDirectory($caseRoot) | Out-Null
     $statusFile = Join-Path $caseRoot "final status.json"
@@ -75,7 +88,7 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
     $captureFile = Join-Path $caseRoot "captured args.json"
     $historyFile = Join-Path $caseRoot "status history.txt"
     $outputFile = Join-Path $caseRoot "output image.png"
-    $prompt = '中文 prompt with spaces and "quoted text"'
+    $prompt = if ($UseQuotedPrompt) { '中文 prompt with spaces and "quoted text"' } else { "中文 prompt with spaces" }
     $promptFlag = if ($UseSingleDashAliases) { "-Prompt" } else { "--prompt" }
     $outputFlag = if ($UseSingleDashAliases) { "-Output" } else { "--output" }
     $qualityFlag = if ($UseSingleDashAliases) { "-Quality" } else { "--quality" }
@@ -94,6 +107,10 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
         "NIUCODES_IMAGEGEN_TEST_HISTORY_FILE" = $historyFile
         "NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE" = $outputFile
         "NIUCODES_IMAGEGEN_TEST_MODE" = $Mode
+        "NIUCODES_IMAGEGEN_TEST_RUNNER" = $runner
+        "NIUCODES_IMAGEGEN_TEST_TIMEOUT_SECONDS" = [string]$TimeoutSeconds
+        "NIUCODES_IMAGEGEN_TEST_EXECUTABLE" = $mockExecutable
+        "NIUCODES_IMAGEGEN_TEST_PROMPT" = $prompt
     }
     $previousEnvironment = @{}
     foreach ($entry in $testEnvironment.GetEnumerator()) {
@@ -101,7 +118,11 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
         [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
     }
     try {
-        & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
+        if ($UseQuotedPrompt) {
+            & $hostExe -NoProfile -ExecutionPolicy Bypass -File $quotedRunnerHelper 1> $stdoutFile 2> $stderrFile
+        } else {
+            & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
+        }
         $exitCode = $LASTEXITCODE
     } finally {
         foreach ($entry in $previousEnvironment.GetEnumerator()) {
@@ -126,7 +147,9 @@ try {
     Assert-True ($success.history -eq "running,success") "status transition"
     Assert-True ($success.stdout.TrimStart().StartsWith("{")) "stdout must be JSON"
     Assert-True (($success.captured -join "|") -match "中文 prompt with spaces") "UTF-8 prompt was not preserved"
-    Assert-True (($success.captured -join "|") -match 'quoted text') "quoted argument was not preserved"
+
+    $quoted = Invoke-RunnerCase "success" 5 $false $true
+    Assert-True (($quoted.captured -join "|") -match '中文 prompt with spaces and "quoted text"') "quoted argument was not preserved"
 
     $aliases = Invoke-RunnerCase "success" 5 $true
     Assert-True ($aliases.exit_code -eq 0) "single-dash alias exit code"
