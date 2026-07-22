@@ -195,7 +195,7 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     inputFidelity: validateChoice(parseString(merged.inputFidelity, undefined), "inputFidelity", ["low", "high"]),
     outputCompression: parseInteger(merged.outputCompression, "outputCompression", { min: 0, max: 100 }),
     n: parseInteger(merged.n, "n", { min: 1, max: 10, fallback: 1 }),
-    timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: 180000 }),
+    timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: 600000 }),
     overwrite: parseBoolean(merged.overwrite, false),
     mask: parseString(merged.mask, undefined),
     user: parseString(merged.user, undefined),

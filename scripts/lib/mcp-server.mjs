@@ -147,7 +147,7 @@ export function createMcpRequestHandler({ cwd = process.cwd() } = {}) {
       respond(id, {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: "niucodes-image-gen", version: "1.1.1" },
+        serverInfo: { name: "niucodes-image-gen", version: "1.1.2" },
       });
       return;
     }
