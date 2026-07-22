@@ -58,7 +58,7 @@ exit 0
 '@ | Set-Content -LiteralPath $mockFile -Encoding UTF8
     @"
 @echo off
-"$hostExe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0mock imagegen.ps1" -MockMode "$Mode" %*
+"$hostExe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0mock imagegen.ps1" -MockMode "$Mode" --% %*
 "@ | Set-Content -LiteralPath $mockCommand -Encoding ASCII
 
     $prompt = '中文 prompt with spaces and "quoted text"'
