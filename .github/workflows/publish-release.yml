@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing Git tag to receive the release assets
         required: true
-        default: v1.1.1
+        default: v1.2.0
         type: string
 
 permissions:

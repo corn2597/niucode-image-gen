@@ -42,7 +42,8 @@ case "$COMMAND" in
 esac
 
 STATUS_FILE=""
-TIMEOUT_SECONDS=240
+# Keep the local wait bound at the supported maximum so it never truncates the configured API deadline.
+TIMEOUT_SECONDS=600
 EXECUTABLE_PATH=""
 IMAGE_ARGUMENTS=()
 while [ "$#" -gt 0 ]; do

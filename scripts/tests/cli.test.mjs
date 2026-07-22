@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,7 +15,7 @@ import {
   resolveConfigPath,
   resolveInvocation,
 } from "../lib/image-client.mjs";
-import { installSkill, upsertMcpServerConfig } from "../lib/installer.mjs";
+import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(".");
@@ -57,61 +57,6 @@ async function withMockServer(handler, run) {
   }
 }
 
-async function startMcpClient({ skillRoot, executable = process.execPath, executableArgs = [scriptPath, "mcp"] }) {
-  const child = spawn(executable, executableArgs, {
-    cwd: repoRoot,
-    env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let pending = "";
-  let stderr = "";
-  const responses = new Map();
-  const waiters = new Map();
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdout.on("data", (chunk) => {
-    pending += chunk;
-    const lines = pending.split("\n");
-    pending = lines.pop();
-    for (const line of lines) {
-      const message = JSON.parse(line);
-      const waiter = waiters.get(message.id);
-      if (waiter) {
-        waiters.delete(message.id);
-        waiter.resolve(message);
-      } else {
-        responses.set(message.id, message);
-      }
-    }
-  });
-  let nextId = 1;
-  return {
-    async request(method, params = {}) {
-      const id = nextId++;
-      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-      if (responses.has(id)) return responses.get(id);
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          waiters.delete(id);
-          reject(new Error(`Timed out waiting for MCP response: ${method}`));
-        }, 5000);
-        waiters.set(id, {
-          resolve: (message) => {
-            clearTimeout(timeout);
-            resolve(message);
-          },
-        });
-      });
-    },
-    async close() {
-      child.stdin.end();
-      await new Promise((resolve) => child.once("exit", resolve));
-      return stderr;
-    },
-  };
-}
-
 test("skill uses a root config file and has no stored key or key setter flow", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
   const config = JSON.parse(await readFile(path.join(repoRoot, "config.json"), "utf8"));
@@ -121,13 +66,15 @@ test("skill uses a root config file and has no stored key or key setter flow", a
   assert.doesNotMatch(skill, /set-skill-api-key|OPENAI_API_KEY|API_KEY:/i);
 });
 
-test("skill uses native MCP tools and does not prescribe a terminal runner for normal calls", async () => {
+test("skill uses its bundled local runner and does not prescribe MCP", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
-  assert.match(skill, /native MCP tool/i);
-  assert.match(skill, /imagegen_generate/);
-  assert.match(skill, /imagegen_edit/);
-  assert.match(skill, /Never use a shell, runner, status file/i);
-  assert.match(skill, /Do not call any tool after a successful result/i);
+  assert.match(skill, /bundled local runner/i);
+  assert.match(skill, /invoke-imagegen\.sh/);
+  assert.match(skill, /invoke-imagegen\.ps1/);
+  assert.match(skill, /timeout-seconds 600/i);
+  assert.match(skill, /do not interrupt the local process/i);
+  assert.doesNotMatch(skill, /imagegen_generate|imagegen_edit|native MCP/i);
+  assert.doesNotMatch(await readFile(scriptPath, "utf8"), /runMcpServer|mcp-server/);
 });
 
 test("Windows installation entrypoint runs the bundled executable in install mode", async () => {
@@ -144,15 +91,14 @@ test("Windows runner atomically replaces status files without File.Replace", asy
   assert.doesNotMatch(runner, /\[System\.IO\.File\]::Replace/);
 });
 
-test("MCP config upsert preserves unrelated server configuration", () => {
+test("legacy MCP config removal preserves unrelated server configuration", () => {
   const initial = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n';
-  const updated = upsertMcpServerConfig(initial, { command: "/Applications/Image Gen", cwd: "/Applications" });
+  const updated = removeLegacyMcpServerConfig(initial);
   assert.match(updated, /\[mcp_servers\.other\]/);
-  assert.match(updated, /command = "\/Applications\/Image Gen"/);
-  assert.equal((updated.match(/\[mcp_servers\.niucodes_image_gen\]/g) ?? []).length, 1);
+  assert.doesNotMatch(updated, /\[mcp_servers\.niucodes_image_gen\]/);
 });
 
-test("installer copies runtime files, preserves config, and configures native MCP", async () => {
+test("installer copies runners, preserves API config, and removes legacy MCP config", async () => {
   const tempDir = await createTempDir();
   const sourceRoot = path.join(tempDir, "source skill");
   const installDir = path.join(tempDir, "installed skill");
@@ -162,119 +108,32 @@ test("installer copies runtime files, preserves config, and configures native MC
   await writeFile(path.join(sourceRoot, "SKILL.md"), "---\nname: niucodes-image-gen\ndescription: test\n---\n");
   await writeFile(path.join(sourceRoot, "config.json"), '{"apiKey":"template-key"}');
   await writeFile(path.join(sourceRoot, "bin", "niucodes-image-gen-macos-arm64"), "binary");
+  await writeFile(path.join(sourceRoot, "scripts", "invoke-imagegen.sh"), "#!/bin/bash\n");
+  await writeFile(path.join(sourceRoot, "scripts", "invoke-imagegen.ps1"), "# runner\n");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved-key"}');
+  await mkdir(path.dirname(configPath), { recursive: true });
+  await writeFile(configPath, '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
   const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
-  assert.equal(result.command, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(result.runner, path.join(installDir, "scripts", "invoke-imagegen.sh"));
+  assert.equal(result.removed_legacy_mcp_config, true);
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved-key"}');
   const codexConfig = await readFile(configPath, "utf8");
-  assert.match(codexConfig, /\[mcp_servers\.niucodes_image_gen\]/);
-  assert.match(codexConfig, /args = \["mcp"\]/);
+  assert.match(codexConfig, /\[mcp_servers\.other\]/);
+  assert.doesNotMatch(codexConfig, /\[mcp_servers\.niucodes_image_gen\]/);
 });
 
-test("MCP server handles generate and edit as single structured calls", async () => {
-  const tempDir = await createTempDir();
-  const skillRoot = path.join(tempDir, "skill root");
-  const outputDir = path.join(tempDir, "output files");
-  const sourceImage = path.join(tempDir, "source image.png");
-  await mkdir(skillRoot, { recursive: true });
-  await writePng(sourceImage);
-  const requests = [];
-  await withMockServer(async (req, res, body) => {
-    requests.push({ url: req.url, body: body.toString("utf8") });
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
-  }, async (baseURL) => {
-    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "mcp-test-key", baseURL, quality: "low" }));
-    const client = await startMcpClient({ skillRoot });
-    const initialized = await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
-    assert.equal(initialized.result.protocolVersion, "2024-11-05");
-    const tools = await client.request("tools/list");
-    assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["imagegen_generate", "imagegen_edit"]);
-
-    const generatedPath = path.join(outputDir, "generated.png");
-    const generated = await client.request("tools/call", {
-      name: "imagegen_generate",
-      arguments: { prompt: "中文 prompt with spaces and \"quotes\"", output: generatedPath, quality: "low" },
-    });
-    const generatedResult = generated.result.structuredContent;
-    assert.equal(generated.result.isError, false);
-    assert.equal(generatedResult.status, "success");
-    assert.equal(generatedResult.saved[0].absolute_path, generatedPath);
-    assert.equal(generatedResult.model, undefined);
-    assert.equal(generatedResult.base_url, undefined);
-    assert.equal(typeof generatedResult.timing_ms.non_api, "number");
-    assert.equal(typeof generatedResult.timing_ms.mcp.total, "number");
-
-    const editedPath = path.join(outputDir, "edited.png");
-    const edited = await client.request("tools/call", {
-      name: "imagegen_edit",
-      arguments: { prompt: "将人物改为男性", output: editedPath, images: [sourceImage], quality: "low" },
-    });
-    assert.equal(edited.result.isError, false);
-    assert.equal(edited.result.structuredContent.status, "success");
-    assert.equal(edited.result.structuredContent.saved[0].absolute_path, editedPath);
-    assert.equal(await client.close(), "");
-  });
-  assert.equal(requests.length, 2);
-  assert.equal(JSON.parse(requests[0].body).prompt, "中文 prompt with spaces and \"quotes\"");
-  assert.equal(requests[1].url, "/v1/images/edits");
-  assert.match(requests[1].body, /将人物改为男性/);
-});
-
-test("Apple Silicon executable serves MCP generate and edit directly", { skip: process.platform !== "darwin" }, async () => {
-  const tempDir = await createTempDir();
-  const skillRoot = path.join(tempDir, "native skill");
-  const outputDir = path.join(tempDir, "native output");
-  const sourceImage = path.join(tempDir, "native source.png");
-  await mkdir(path.join(skillRoot, "bin"), { recursive: true });
-  await (await import("node:fs/promises")).copyFile(macosArm64BinaryPath, path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64"));
-  await writePng(sourceImage);
-  await withMockServer(async (req, res, body) => {
-    assert.ok(["/v1/images/generations", "/v1/images/edits"].includes(req.url));
-    assert.match(body.toString("utf8"), /原样中文|覆盖已有输出/);
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
-  }, async (baseURL) => {
-    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "native-mcp-key", baseURL, quality: "low" }));
-    const client = await startMcpClient({
-      skillRoot,
-      executable: path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64"),
-      executableArgs: ["mcp"],
-    });
-    await client.request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "1" } });
-    const generated = await client.request("tools/call", {
-      name: "imagegen_generate",
-      arguments: { prompt: "原样中文 generate", output: path.join(outputDir, "generated.png") },
-    });
-    assert.equal(generated.result.structuredContent.status, "success");
-    assert.equal(generated.result.structuredContent.saved[0].absolute_path, path.join(outputDir, "generated.png"));
-    assert.equal(generated.result.structuredContent.render, `![generate-1](${path.join(outputDir, "generated.png")})`);
-    assert.equal(generated.result.content[0].text, generated.result.structuredContent.final_answer);
-    await writeFile(path.join(outputDir, "generated.png"), "previous output");
-    const overwritten = await client.request("tools/call", {
-      name: "imagegen_generate",
-      arguments: { prompt: "覆盖已有输出", output: path.join(outputDir, "generated.png") },
-    });
-    assert.equal(overwritten.result.structuredContent.saved[0].absolute_path, path.join(outputDir, "generated.png"));
-    assert.deepEqual(await readFile(path.join(outputDir, "generated.png")), Buffer.from(fixturePngBase64, "base64"));
-    const edited = await client.request("tools/call", {
-      name: "imagegen_edit",
-      arguments: { prompt: "原样中文 edit", output: path.join(outputDir, "edited.png"), images: [sourceImage] },
-    });
-    assert.equal(edited.result.structuredContent.status, "success");
-    assert.equal(await client.close(), "");
-  });
-});
-
-test("Apple Silicon installer installs a native MCP package without overwriting config", { skip: process.platform !== "darwin" }, async () => {
+test("Apple Silicon installer deploys the runner and removes legacy MCP config", { skip: process.platform !== "darwin" }, async () => {
   const tempDir = await createTempDir();
   const installDir = path.join(tempDir, "installed skill");
   const configPath = path.join(tempDir, "codex config", "config.toml");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved"}');
+  await mkdir(path.dirname(configPath), { recursive: true });
+  await writeFile(configPath, '[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
   const { stdout, stderr } = await execFileAsync(macosArm64BinaryPath, [
     "install", "--install-dir", installDir, "--config-path", configPath,
@@ -282,9 +141,10 @@ test("Apple Silicon installer installs a native MCP package without overwriting 
   const result = JSON.parse(stdout);
   assert.equal(stderr, "");
   assert.equal(result.status, "success");
-  assert.equal(result.command, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(result.runner, path.join(installDir, "scripts", "invoke-imagegen.sh"));
+  assert.match(await readFile(result.runner, "utf8"), /TIMEOUT_SECONDS=600/);
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved"}');
-  assert.match(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
+  assert.doesNotMatch(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
 });
 
 test("macOS runner waits locally and emits one final status JSON", { skip: process.platform !== "darwin" }, async () => {

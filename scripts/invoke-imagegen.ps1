@@ -8,7 +8,8 @@ param(
     [string]$StatusFile,
 
     [ValidateRange(1, 600)]
-    [int]$TimeoutSeconds = 240,
+    # Keep the local wait bound at the supported maximum so it never truncates the configured API deadline.
+    [int]$TimeoutSeconds = 600,
 
     # Test-only override. Production calls locate the bundled executable from this script.
     [string]$ExecutablePath,

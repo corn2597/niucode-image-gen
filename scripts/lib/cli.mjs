@@ -41,7 +41,7 @@ Common options:
   --moderation <value>          auto | low
   --n <count>                   Number of images to save. Default: 1
   --overwrite                   Overwrite the first output path if it already exists.
-  --timeout-ms <ms>             SDK timeout in milliseconds. Default: 180000
+  --timeout-ms <ms>             SDK timeout in milliseconds. Default: 600000
   --status-file <path>          Optional JSON lifecycle file. Written atomically after each state change.
   --verbose-response            Include expanded request/response metadata in the JSON output.
 

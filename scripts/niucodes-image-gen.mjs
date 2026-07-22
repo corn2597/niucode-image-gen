@@ -4,14 +4,9 @@ import process from "node:process";
 
 import { runInstaller } from "./lib/installer.mjs";
 import { runCli } from "./lib/cli.mjs";
-import { runMcpServer } from "./lib/mcp-server.mjs";
 
 async function main() {
   try {
-    if (process.argv[2] === "mcp") {
-      await runMcpServer();
-      return;
-    }
     if (process.argv[2] === "install") {
       process.stdout.write(`${JSON.stringify(await runInstaller(process.argv.slice(3)))}\n`);
       return;

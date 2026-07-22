@@ -6,11 +6,7 @@ import process from "node:process";
 import { resolveSkillRoot } from "./image-client.mjs";
 
 const SKILL_NAME = "niucodes-image-gen";
-const SERVER_NAME = "niucodes_image_gen";
-
-function tomlString(value) {
-  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
+const LEGACY_SERVER_NAME = "niucodes_image_gen";
 
 export function selectPlatformBinary({ platform = process.platform, arch = process.arch, skillRoot } = {}) {
   if (platform === "darwin" && arch === "arm64") return path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64");
@@ -27,27 +23,20 @@ export function defaultConfigPath(home = os.homedir()) {
   return path.join(home, ".codex", "config.toml");
 }
 
-export function upsertMcpServerConfig(configText, { command, cwd }) {
-  const headerPattern = /^\[mcp_servers\.niucodes_image_gen\][^\n]*(?:\n|$)/m;
+export function removeLegacyMcpServerConfig(configText) {
+  const headerPattern = new RegExp(`^\\[mcp_servers\\.${LEGACY_SERVER_NAME}\\][^\\n]*(?:\\n|$)`, "m");
   const match = configText.match(headerPattern);
-  let retained = configText;
-  if (match && match.index !== undefined) {
-    const blockStart = match.index;
-    const afterHeaderStart = blockStart + match[0].length;
-    const nextHeaderMatch = configText.slice(afterHeaderStart).match(/^\[[^\n]+\][^\n]*(?:\n|$)/m);
-    const blockEnd = nextHeaderMatch?.index === undefined
-      ? configText.length
-      : afterHeaderStart + nextHeaderMatch.index;
-    retained = `${configText.slice(0, blockStart)}${configText.slice(blockEnd)}`;
-  }
-  retained = retained.replace(/\n{3,}/g, "\n\n").trimEnd();
-  const block = [
-    `[mcp_servers.${SERVER_NAME}]`,
-    `command = ${tomlString(command)}`,
-    'args = ["mcp"]',
-    `cwd = ${tomlString(cwd)}`,
-  ].join("\n");
-  return `${retained}${retained ? "\n\n" : ""}${block}\n`;
+  if (!match || match.index === undefined) return configText;
+  const blockStart = match.index;
+  const afterHeaderStart = blockStart + match[0].length;
+  const nextHeaderMatch = configText.slice(afterHeaderStart).match(/^\[[^\n]+\][^\n]*(?:\n|$)/m);
+  const blockEnd = nextHeaderMatch?.index === undefined
+    ? configText.length
+    : afterHeaderStart + nextHeaderMatch.index;
+  const retained = `${configText.slice(0, blockStart)}${configText.slice(blockEnd)}`
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+  return retained ? `${retained}\n` : "";
 }
 
 async function exists(filePath) {
@@ -71,6 +60,8 @@ async function copyRuntimePackage(packageRoot, installDir) {
     "SKILL.md",
     path.join("agents", "openai.yaml"),
     path.join(".codex-plugin", "plugin.json"),
+    path.join("scripts", "invoke-imagegen.sh"),
+    path.join("scripts", "invoke-imagegen.ps1"),
   ];
   for (const relativePath of staticFiles) {
     await copyIfPresent(path.join(packageRoot, relativePath), path.join(installDir, relativePath));
@@ -95,19 +86,33 @@ export async function installSkill({
   if (sourceRoot !== targetRoot) {
     await copyRuntimePackage(sourceRoot, targetRoot);
   }
-  const command = selectPlatformBinary({ platform, arch, skillRoot: targetRoot });
-  if (!(await exists(command))) {
-    throw new Error(`Installed MCP executable was not found: ${command}`);
+  const executable = selectPlatformBinary({ platform, arch, skillRoot: targetRoot });
+  if (!(await exists(executable))) {
+    throw new Error(`Installed executable was not found: ${executable}`);
   }
-  await mkdir(path.dirname(configPath), { recursive: true });
-  const currentConfig = (await exists(configPath)) ? await readFile(configPath, "utf8") : "";
-  await writeFile(configPath, upsertMcpServerConfig(currentConfig, { command, cwd: targetRoot }), { mode: 0o600 });
+  const runner = platform === "win32"
+    ? path.join(targetRoot, "scripts", "invoke-imagegen.ps1")
+    : path.join(targetRoot, "scripts", "invoke-imagegen.sh");
+  if (!(await exists(runner))) {
+    throw new Error(`Installed local runner was not found: ${runner}`);
+  }
+
+  let removedLegacyMcpConfig = false;
+  if (await exists(configPath)) {
+    const currentConfig = await readFile(configPath, "utf8");
+    const updatedConfig = removeLegacyMcpServerConfig(currentConfig);
+    if (updatedConfig !== currentConfig) {
+      await writeFile(configPath, updatedConfig, { mode: 0o600 });
+      removedLegacyMcpConfig = true;
+    }
+  }
   return {
     status: "success",
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
-    mcp_server: SERVER_NAME,
-    command,
+    executable,
+    runner,
+    removed_legacy_mcp_config: removedLegacyMcpConfig,
     restart_required: true,
   };
 }

@@ -1,7 +1,7 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.1.2",
-  "description": "Native MCP image generation and editing through the configured OpenAI Images API.",
+  "version": "1.2.0",
+  "description": "Native local image generation and editing through the configured OpenAI Images API.",
   "author": {
     "name": "NiuCodes"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "NiuCodes Image Gen",
     "shortDescription": "Native image generation and editing",
-    "longDescription": "Uses a local native MCP executable to send image generation and editing requests directly to the configured Images API.",
+    "longDescription": "Uses a bundled local runner and native executable to send image generation and editing requests directly to the configured Images API.",
     "developerName": "NiuCodes",
     "category": "Productivity",
     "capabilities": ["Write"],
