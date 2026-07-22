@@ -1,6 +1,6 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Native local image generation and editing through the configured OpenAI Images API.",
   "author": {
     "name": "NiuCodes"

@@ -16,31 +16,8 @@ param(
     # Test-only override. Production calls locate the bundled executable from this script.
     [string]$ExecutablePath,
 
-    [string]$Prompt,
-    [string]$Output,
-    [string[]]$Image,
-    [string]$Mask,
-    [string]$Quality,
-    [string]$Size,
-    [string]$Model,
-    [string]$Config,
-    [Alias("base-url")]
-    [string]$BaseUrl,
-    [Alias("output-format")]
-    [string]$OutputFormat,
-    [string]$Background,
-    [string]$Moderation,
-    [string]$N,
-    [string]$Overwrite,
-    [Alias("timeout-ms")]
-    [string]$TimeoutMs,
-    [Alias("verbose-response")]
-    [string]$VerboseResponse,
-    [Alias("input-fidelity")]
-    [string]$InputFidelity,
-    [Alias("output-compression")]
-    [string]$OutputCompression,
-
+    # Image CLI options deliberately bypass PowerShell binding. It can reinterpret
+    # values such as `true` as a later named parameter on Windows PowerShell 5.1.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ImageArguments
 )
@@ -147,15 +124,6 @@ function Normalize-ImageArguments([string[]]$Arguments) {
     })
 }
 
-function Add-ImageOption([System.Collections.Generic.List[string]]$Destination, [string]$Name, $Value) {
-    if ($null -eq $Value) { return }
-    foreach ($item in @($Value)) {
-        if ($null -eq $item) { continue }
-        $Destination.Add("--$Name")
-        $Destination.Add([string]$item)
-    }
-}
-
 $skillRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ExecutablePath) {
     $ExecutablePath = Join-Path $skillRoot "bin\niucodes-image-gen-win-x64.exe"
@@ -165,24 +133,6 @@ if ($ImageArguments -contains "--status-file") {
     throw "Pass -StatusFile to invoke-imagegen.ps1; do not pass --status-file to the executable arguments."
 }
 $normalizedImageArguments = New-Object 'System.Collections.Generic.List[string]'
-Add-ImageOption $normalizedImageArguments "prompt" $Prompt
-Add-ImageOption $normalizedImageArguments "output" $Output
-Add-ImageOption $normalizedImageArguments "image" $Image
-Add-ImageOption $normalizedImageArguments "mask" $Mask
-Add-ImageOption $normalizedImageArguments "quality" $Quality
-Add-ImageOption $normalizedImageArguments "size" $Size
-Add-ImageOption $normalizedImageArguments "model" $Model
-Add-ImageOption $normalizedImageArguments "config" $Config
-Add-ImageOption $normalizedImageArguments "base-url" $BaseUrl
-Add-ImageOption $normalizedImageArguments "output-format" $OutputFormat
-Add-ImageOption $normalizedImageArguments "background" $Background
-Add-ImageOption $normalizedImageArguments "moderation" $Moderation
-Add-ImageOption $normalizedImageArguments "n" $N
-Add-ImageOption $normalizedImageArguments "overwrite" $Overwrite
-Add-ImageOption $normalizedImageArguments "timeout-ms" $TimeoutMs
-Add-ImageOption $normalizedImageArguments "verbose-response" $VerboseResponse
-Add-ImageOption $normalizedImageArguments "input-fidelity" $InputFidelity
-Add-ImageOption $normalizedImageArguments "output-compression" $OutputCompression
 foreach ($argument in @(Normalize-ImageArguments $ImageArguments)) {
     [void]$normalizedImageArguments.Add([string]$argument)
 }

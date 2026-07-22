@@ -92,8 +92,11 @@ test("Windows runner atomically replaces status files without File.Replace", asy
   assert.match(runner, /function Normalize-ImageArguments/);
   assert.match(runner, /"-prompt"\s*=\s*"--prompt"/);
   assert.match(runner, /"-output"\s*=\s*"--output"/);
-  assert.match(runner, /\[string\]\$Prompt/);
-  assert.match(runner, /Add-ImageOption \$normalizedImageArguments "prompt" \$Prompt/);
+  assert.match(runner, /\[Parameter\(ValueFromRemainingArguments = \$true\)\]/);
+  assert.match(runner, /\[string\[\]\]\$ImageArguments/);
+  assert.doesNotMatch(runner, /\[string\]\$Prompt/);
+  assert.doesNotMatch(runner, /\[string\]\$Config/);
+  assert.doesNotMatch(runner, /function Add-ImageOption/);
   assert.match(runner, /\$null -eq \$Arguments -or \$Arguments\.Count -eq 0/);
   assert.match(runner, /foreach \(\$argument in @\(Normalize-ImageArguments \$ImageArguments\)\)/);
   assert.doesNotMatch(runner, /\.AddRange\(/);

@@ -79,6 +79,13 @@ function Has-ImageOption($Captured, [string]$Name) {
     return (($values -contains "--$Name") -or ($values -contains "-$Name"))
 }
 
+function Get-ImageOptionValue($Captured, [string]$Name) {
+    $values = @($Captured)
+    $index = [Array]::IndexOf($values, "--$Name")
+    if ($index -lt 0 -or $index -ge ($values.Count - 1)) { return $null }
+    return $values[$index + 1]
+}
+
 function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSingleDashAliases = $false, [bool]$UseQuotedPrompt = $false) {
     $caseRoot = Join-Path $tempRoot ("case with spaces " + $Mode)
     [System.IO.Directory]::CreateDirectory($caseRoot) | Out-Null
@@ -147,6 +154,9 @@ try {
     Assert-True ($success.history -eq "running,success") "status transition"
     Assert-True ($success.stdout.TrimStart().StartsWith("{")) "stdout must be JSON"
     Assert-True (($success.captured -join "|") -match "中文 prompt with spaces") "UTF-8 prompt was not preserved"
+    Assert-True ((Get-ImageOptionValue $success.captured "overwrite") -eq "true") "overwrite value was not preserved"
+    Assert-True ((Get-ImageOptionValue $success.captured "output") -eq $success.status.saved[0].absolute_path) "output value was not preserved"
+    Assert-True (-not ((Get-ImageOptionValue $success.captured "config") -eq "true")) "overwrite value was misbound as config"
 
     $quoted = Invoke-RunnerCase "success" 5 $false $true
     Assert-True (($quoted.captured -join "|") -match '中文 prompt with spaces and "quoted text"') "quoted argument was not preserved"
