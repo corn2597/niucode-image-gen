@@ -57,7 +57,7 @@ function Write-Stderr([string]$Message) {
 function ConvertTo-WindowsCommandLine([string[]]$Arguments) {
     return (($Arguments | ForEach-Object {
         if ($_ -notmatch '[\s"]') { return $_ }
-        '"' + ($_ -replace '(\\*)"', '$1$1\\"' -replace '(\\*)$', '$1$1') + '"'
+        '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\*)$', '$1$1') + '"'
     }) -join ' ')
 }
 
