@@ -183,7 +183,9 @@ Add-ImageOption $normalizedImageArguments "timeout-ms" $TimeoutMs
 Add-ImageOption $normalizedImageArguments "verbose-response" $VerboseResponse
 Add-ImageOption $normalizedImageArguments "input-fidelity" $InputFidelity
 Add-ImageOption $normalizedImageArguments "output-compression" $OutputCompression
-$normalizedImageArguments.AddRange([string[]](Normalize-ImageArguments $ImageArguments))
+foreach ($argument in @(Normalize-ImageArguments $ImageArguments)) {
+    [void]$normalizedImageArguments.Add([string]$argument)
+}
 $arguments = @($Command) + @($normalizedImageArguments) + @("--status-file", $StatusFile)
 $startedAt = [DateTime]::UtcNow
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
