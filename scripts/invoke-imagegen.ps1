@@ -191,6 +191,7 @@ $startedAt = [DateTime]::UtcNow
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $process = $null
 $finalResult = $null
+$timedOut = $false
 
 try {
     if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
@@ -228,6 +229,7 @@ try {
     } while ($true)
 
     if ([DateTime]::UtcNow -ge $deadline -and -not $process.HasExited -and -not $finalResult) {
+        $timedOut = $true
         $process.Kill()
         $process.WaitForExit()
         $finalResult = New-FailureResult $Command 124 "Timed out after $TimeoutSeconds seconds." @{ total = [int][Math]::Round($stopwatch.Elapsed.TotalMilliseconds) }
@@ -237,6 +239,7 @@ try {
     }
 
     $childExitCode = $process.ExitCode
+    if ($timedOut) { $childExitCode = 124 }
     $childStderr = $stderrTask.GetAwaiter().GetResult()
     [void]$stdoutTask.GetAwaiter().GetResult()
     if ($childStderr) { Write-Stderr $childStderr.TrimEnd() }
