@@ -30,15 +30,6 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
     @'
 param([string]$MockMode)
 $ErrorActionPreference = "Stop"
-function ArgValue([string]$Name) {
-    $names = @($Name)
-    if ($Name.StartsWith("--")) { $names += "-" + $Name.Substring(2) }
-    foreach ($candidate in $names) {
-        $index = [Array]::IndexOf([string[]]$args, $candidate)
-        if ($index -ge 0 -and $index + 1 -lt $args.Length) { return $args[$index + 1] }
-    }
-    return $null
-}
 function Write-Status([string]$Path, [string]$State, [int]$ExitCode) {
     $payload = [ordered]@{
         version = 1; status = $State; command = $args[0]; exit_code = $ExitCode
@@ -48,10 +39,10 @@ function Write-Status([string]$Path, [string]$State, [int]$ExitCode) {
     }
     [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Compress -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
 }
-$statusFile = ArgValue "--status-file"
-$caseRoot = Split-Path -Parent $statusFile
-$captureFile = Join-Path $caseRoot "captured args.json"
-$historyFile = Join-Path $caseRoot "status history.txt"
+$statusFile = $env:NIUCODES_IMAGEGEN_TEST_STATUS_FILE
+$captureFile = $env:NIUCODES_IMAGEGEN_TEST_CAPTURE_FILE
+$historyFile = $env:NIUCODES_IMAGEGEN_TEST_HISTORY_FILE
+$outputFile = $env:NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE
 [System.IO.File]::WriteAllText($captureFile, ($args | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
 Write-Status $statusFile "running" 0
 [System.IO.File]::WriteAllText($historyFile, "running", (New-Object System.Text.UTF8Encoding($false)))
@@ -60,7 +51,7 @@ Start-Sleep -Milliseconds 150
 if ($MockMode -eq "failed") { Write-Status $statusFile "failed" 7; exit 7 }
 $payload = Get-Content -LiteralPath $statusFile -Raw | ConvertFrom-Json
 $payload.status = "success"; $payload.exit_code = 0
-$payload.saved = @(@{ index = 0; absolute_path = (ArgValue "--output"); markdown_path = "mock.png"; markdown = "![mock](mock.png)"; revised_prompt = $null })
+$payload.saved = @(@{ index = 0; absolute_path = $outputFile; markdown_path = "mock.png"; markdown = "![mock](mock.png)"; revised_prompt = $null })
 [System.IO.File]::WriteAllText($statusFile, ($payload | ConvertTo-Json -Compress -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
 [System.IO.File]::AppendAllText($historyFile, ",success", (New-Object System.Text.UTF8Encoding($false)))
 exit 0
@@ -83,8 +74,25 @@ exit 0
         $promptFlag, $prompt,
         $outputFlag, $outputFile, $qualityFlag, "low", $sizeFlag, "1024x1024", $overwriteFlag, "true"
     )
-    & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
-    $exitCode = $LASTEXITCODE
+    $testEnvironment = @{
+        "NIUCODES_IMAGEGEN_TEST_STATUS_FILE" = $statusFile
+        "NIUCODES_IMAGEGEN_TEST_CAPTURE_FILE" = $captureFile
+        "NIUCODES_IMAGEGEN_TEST_HISTORY_FILE" = $historyFile
+        "NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE" = $outputFile
+    }
+    $previousEnvironment = @{}
+    foreach ($entry in $testEnvironment.GetEnumerator()) {
+        $previousEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
+        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+    }
+    try {
+        & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
+        $exitCode = $LASTEXITCODE
+    } finally {
+        foreach ($entry in $previousEnvironment.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        }
+    }
     return [ordered]@{
         exit_code = $exitCode
         result = Get-Content -LiteralPath $stdoutFile -Raw -Encoding UTF8 | ConvertFrom-Json
