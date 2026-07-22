@@ -82,6 +82,41 @@ function New-FailureResult([string]$FailureCommand, [int]$ExitCode, [string]$Mes
     }
 }
 
+function Normalize-ImageArguments([string[]]$Arguments) {
+    # Accept common PowerShell spellings while preserving the native CLI contract.
+    $aliases = @{
+        "-prompt" = "--prompt"
+        "-output" = "--output"
+        "-image" = "--image"
+        "-mask" = "--mask"
+        "-quality" = "--quality"
+        "-size" = "--size"
+        "-model" = "--model"
+        "-config" = "--config"
+        "-baseurl" = "--base-url"
+        "-base-url" = "--base-url"
+        "-outputformat" = "--output-format"
+        "-output-format" = "--output-format"
+        "-background" = "--background"
+        "-moderation" = "--moderation"
+        "-n" = "--n"
+        "-overwrite" = "--overwrite"
+        "-timeoutms" = "--timeout-ms"
+        "-timeout-ms" = "--timeout-ms"
+        "-verboseresponse" = "--verbose-response"
+        "-verbose-response" = "--verbose-response"
+        "-inputfidelity" = "--input-fidelity"
+        "-input-fidelity" = "--input-fidelity"
+        "-outputcompression" = "--output-compression"
+        "-output-compression" = "--output-compression"
+    }
+
+    return @($Arguments | ForEach-Object {
+        $alias = $aliases[$_.ToLowerInvariant()]
+        if ($alias) { $alias } else { $_ }
+    })
+}
+
 $skillRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ExecutablePath) {
     $ExecutablePath = Join-Path $skillRoot "bin\niucodes-image-gen-win-x64.exe"
@@ -90,6 +125,7 @@ $StatusFile = [System.IO.Path]::GetFullPath($StatusFile)
 if ($ImageArguments -contains "--status-file") {
     throw "Pass -StatusFile to invoke-imagegen.ps1; do not pass --status-file to the executable arguments."
 }
+$ImageArguments = Normalize-ImageArguments $ImageArguments
 $arguments = @($Command) + @($ImageArguments) + @("--status-file", $StatusFile)
 $startedAt = [DateTime]::UtcNow
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()

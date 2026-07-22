@@ -11,7 +11,7 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
-function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5) {
+function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSingleDashAliases = $false) {
     $caseRoot = Join-Path $tempRoot ("case with spaces " + $Mode)
     [System.IO.Directory]::CreateDirectory($caseRoot) | Out-Null
     $statusFile = Join-Path $caseRoot "final status.json"
@@ -62,12 +62,17 @@ exit 0
 "@ | Set-Content -LiteralPath $mockCommand -Encoding ASCII
 
     $prompt = '中文 prompt with spaces and "quoted text"'
+    $promptFlag = if ($UseSingleDashAliases) { "-Prompt" } else { "--prompt" }
+    $outputFlag = if ($UseSingleDashAliases) { "-Output" } else { "--output" }
+    $qualityFlag = if ($UseSingleDashAliases) { "-Quality" } else { "--quality" }
+    $sizeFlag = if ($UseSingleDashAliases) { "-Size" } else { "--size" }
+    $overwriteFlag = if ($UseSingleDashAliases) { "-Overwrite" } else { "--overwrite" }
     $runnerArguments = @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner,
         "generate", "-StatusFile", $statusFile, "-TimeoutSeconds", $TimeoutSeconds,
         "-ExecutablePath", $mockCommand,
-        "--mode", $Mode, "--capture", $captureFile, "--history", $historyFile, "--prompt", $prompt,
-        "--output", $outputFile
+        "--mode", $Mode, "--capture", $captureFile, "--history", $historyFile, $promptFlag, $prompt,
+        $outputFlag, $outputFile, $qualityFlag, "low", $sizeFlag, "1024x1024", $overwriteFlag, "true"
     )
     & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
     $exitCode = $LASTEXITCODE
@@ -90,6 +95,16 @@ try {
     Assert-True ($success.stdout.TrimStart().StartsWith("{")) "stdout must be JSON"
     Assert-True (($success.captured -join "|") -match "中文 prompt with spaces") "UTF-8 prompt was not preserved"
     Assert-True (($success.captured -join "|") -match 'quoted text') "quoted argument was not preserved"
+
+    $aliases = Invoke-RunnerCase "success" 5 $true
+    Assert-True ($aliases.exit_code -eq 0) "single-dash alias exit code"
+    Assert-True (($aliases.captured -join "|") -contains "--prompt") "-Prompt was not normalized"
+    Assert-True (($aliases.captured -join "|") -contains "--output") "-Output was not normalized"
+    Assert-True (($aliases.captured -join "|") -contains "--quality") "-Quality was not normalized"
+    Assert-True (($aliases.captured -join "|") -contains "--size") "-Size was not normalized"
+    Assert-True (($aliases.captured -join "|") -contains "--overwrite") "-Overwrite was not normalized"
+    Assert-True (-not (($aliases.captured -join "|") -match '(^|\|)-Prompt(\||$)')) "-Prompt reached the executable"
+    Assert-True (($aliases.captured -join "|") -match "中文 prompt with spaces") "single-dash UTF-8 prompt was not preserved"
 
     $failed = Invoke-RunnerCase "failed"
     Assert-True ($failed.exit_code -eq 7) "failed exit code"
