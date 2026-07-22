@@ -23,7 +23,7 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
     $mockFile = Join-Path $caseRoot "mock imagegen.ps1"
     $mockCommand = Join-Path $caseRoot "mock imagegen.cmd"
     @'
-param()
+param([string]$MockMode)
 $ErrorActionPreference = "Stop"
 function ArgValue([string]$Name) {
     $index = [Array]::IndexOf([string[]]$args, $Name)
@@ -39,16 +39,16 @@ function Write-Status([string]$Path, [string]$State, [int]$ExitCode) {
     }
     [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Compress -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
 }
-$mode = ArgValue "--mode"
 $statusFile = ArgValue "--status-file"
-$captureFile = ArgValue "--capture"
-$historyFile = ArgValue "--history"
+$caseRoot = Split-Path -Parent $statusFile
+$captureFile = Join-Path $caseRoot "captured args.json"
+$historyFile = Join-Path $caseRoot "status history.txt"
 [System.IO.File]::WriteAllText($captureFile, ($args | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
 Write-Status $statusFile "running" 0
 [System.IO.File]::WriteAllText($historyFile, "running", (New-Object System.Text.UTF8Encoding($false)))
-if ($mode -eq "slow") { Start-Sleep -Seconds 4; exit 0 }
+if ($MockMode -eq "slow") { Start-Sleep -Seconds 4; exit 0 }
 Start-Sleep -Milliseconds 150
-if ($mode -eq "failed") { Write-Status $statusFile "failed" 7; exit 7 }
+if ($MockMode -eq "failed") { Write-Status $statusFile "failed" 7; exit 7 }
 $payload = Get-Content -LiteralPath $statusFile -Raw | ConvertFrom-Json
 $payload.status = "success"; $payload.exit_code = 0
 $payload.saved = @(@{ index = 0; absolute_path = (ArgValue "--output"); markdown_path = "mock.png"; markdown = "![mock](mock.png)"; revised_prompt = $null })
@@ -58,7 +58,7 @@ exit 0
 '@ | Set-Content -LiteralPath $mockFile -Encoding UTF8
     @"
 @echo off
-"$hostExe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0mock imagegen.ps1" %*
+"$hostExe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0mock imagegen.ps1" -MockMode "$Mode" %*
 "@ | Set-Content -LiteralPath $mockCommand -Encoding ASCII
 
     $prompt = '中文 prompt with spaces and "quoted text"'
@@ -69,9 +69,9 @@ exit 0
     $overwriteFlag = if ($UseSingleDashAliases) { "-Overwrite" } else { "--overwrite" }
     $runnerArguments = @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner,
-        "generate", "-StatusFile", $statusFile, "-TimeoutSeconds", $TimeoutSeconds,
+        "generate", "--status-file", $statusFile, "--timeout-seconds", $TimeoutSeconds,
         "-ExecutablePath", $mockCommand,
-        "--mode", $Mode, "--capture", $captureFile, "--history", $historyFile, $promptFlag, $prompt,
+        $promptFlag, $prompt,
         $outputFlag, $outputFile, $qualityFlag, "low", $sizeFlag, "1024x1024", $overwriteFlag, "true"
     )
     & $hostExe @runnerArguments 1> $stdoutFile 2> $stderrFile
