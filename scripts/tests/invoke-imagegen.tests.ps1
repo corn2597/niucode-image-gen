@@ -11,6 +11,11 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Has-ImageOption($Captured, [string]$Name) {
+    $values = @($Captured)
+    return (($values -contains "--$Name") -or ($values -contains "-$Name"))
+}
+
 function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSingleDashAliases = $false) {
     $caseRoot = Join-Path $tempRoot ("case with spaces " + $Mode)
     [System.IO.Directory]::CreateDirectory($caseRoot) | Out-Null
@@ -26,8 +31,12 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
 param([string]$MockMode)
 $ErrorActionPreference = "Stop"
 function ArgValue([string]$Name) {
-    $index = [Array]::IndexOf([string[]]$args, $Name)
-    if ($index -ge 0 -and $index + 1 -lt $args.Length) { return $args[$index + 1] }
+    $names = @($Name)
+    if ($Name.StartsWith("--")) { $names += "-" + $Name.Substring(2) }
+    foreach ($candidate in $names) {
+        $index = [Array]::IndexOf([string[]]$args, $candidate)
+        if ($index -ge 0 -and $index + 1 -lt $args.Length) { return $args[$index + 1] }
+    }
     return $null
 }
 function Write-Status([string]$Path, [string]$State, [int]$ExitCode) {
@@ -98,11 +107,11 @@ try {
 
     $aliases = Invoke-RunnerCase "success" 5 $true
     Assert-True ($aliases.exit_code -eq 0) "single-dash alias exit code"
-    Assert-True (($aliases.captured -join "|") -contains "--prompt") "-Prompt was not normalized"
-    Assert-True (($aliases.captured -join "|") -contains "--output") "-Output was not normalized"
-    Assert-True (($aliases.captured -join "|") -contains "--quality") "-Quality was not normalized"
-    Assert-True (($aliases.captured -join "|") -contains "--size") "-Size was not normalized"
-    Assert-True (($aliases.captured -join "|") -contains "--overwrite") "-Overwrite was not normalized"
+    Assert-True (Has-ImageOption $aliases.captured "prompt") "-Prompt was not normalized"
+    Assert-True (Has-ImageOption $aliases.captured "output") "-Output was not normalized"
+    Assert-True (Has-ImageOption $aliases.captured "quality") "-Quality was not normalized"
+    Assert-True (Has-ImageOption $aliases.captured "size") "-Size was not normalized"
+    Assert-True (Has-ImageOption $aliases.captured "overwrite") "-Overwrite was not normalized"
     Assert-True (-not (($aliases.captured -join "|") -match '(^|\|)-Prompt(\||$)')) "-Prompt reached the executable"
     Assert-True (($aliases.captured -join "|") -match "中文 prompt with spaces") "single-dash UTF-8 prompt was not preserved"
 
