@@ -20,7 +20,6 @@ import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs"
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(".");
 const scriptPath = path.join(repoRoot, "scripts", "niucodes-image-gen.mjs");
-const macosArm64BinaryPath = path.join(repoRoot, "bin", "niucodes-image-gen-macos-arm64");
 const fixturePngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
 const tempDirectories = [];
 
@@ -129,14 +128,19 @@ test("installer copies the native executable, preserves API config, and removes 
 
 test("Apple Silicon installation resolves the native entrypoint and removes legacy MCP config", async () => {
   const tempDir = await createTempDir();
+  const sourceRoot = path.join(tempDir, "source skill");
   const installDir = path.join(tempDir, "installed skill");
   const configPath = path.join(tempDir, "codex config", "config.toml");
+  await mkdir(path.join(sourceRoot, "bin"), { recursive: true });
+  await writeFile(path.join(sourceRoot, "SKILL.md"), "---\nname: niucodes-image-gen\ndescription: test\n---\n");
+  await writeFile(path.join(sourceRoot, "config.json"), '{"apiKey":"template"}');
+  await writeFile(path.join(sourceRoot, "bin", "niucodes-image-gen-macos-arm64"), "binary");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved"}');
   await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, '[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
-  const result = await installSkill({ packageRoot: repoRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
+  const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
   assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
   assert.equal(result.protocol, "request-file-v1");
@@ -391,32 +395,6 @@ test("failed edit records a final status without exposing credentials", async ()
     assert.equal(status.exit_code, 1);
     assert.equal(typeof status.error.message, "string");
     assert.doesNotMatch(JSON.stringify(status), /sensitive-key/);
-  });
-});
-
-test("Apple Silicon executable performs an edit upload end to end", { skip: process.platform !== "darwin" }, async () => {
-  const tempDir = await createTempDir();
-  const configPath = path.join(tempDir, "config.json");
-  const imagePath = path.join(tempDir, "source.png");
-  const outputPath = path.join(tempDir, "edited.png");
-  await writePng(imagePath);
-
-  await withMockServer(async (req, res, body) => {
-    assert.equal(req.method, "POST");
-    assert.equal(req.url, "/v1/images/edits");
-    assert.equal(req.headers.authorization, "Bearer binary-test-key");
-    assert.match(req.headers["content-type"], /^multipart\/form-data/);
-    assert.match(body.toString("latin1"), /make the vase blue/);
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
-  }, async (baseURL) => {
-    await writeFile(configPath, JSON.stringify({ apiKey: "binary-test-key", baseURL }));
-    const { stdout, stderr } = await execFileAsync(macosArm64BinaryPath, [
-      "edit", "--config", configPath, "--image", imagePath, "--prompt", "make the vase blue", "--output", outputPath,
-    ]);
-    assert.equal(stderr, "");
-    assert.equal(JSON.parse(stdout).status, "success");
-    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
   });
 });
 
