@@ -6,6 +6,56 @@ $runner = Join-Path $repoRoot "scripts\invoke-imagegen.ps1"
 $hostExe = (Get-Process -Id $PID).Path
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("niucodes imagegen runner " + [guid]::NewGuid().ToString("N"))
 [System.IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+$mockExecutable = Join-Path $tempRoot "mock imagegen.exe"
+
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+public static class MockImageGen {
+    private static readonly Encoding Utf8 = new UTF8Encoding(false);
+
+    private static string Escape(string value) {
+        return (value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+
+    private static void WriteStatus(string path, string command, string state, int exitCode, string output) {
+        string saved = state == "success"
+            ? "[{\"index\":0,\"absolute_path\":\"" + Escape(output) + "\",\"markdown_path\":\"mock.png\",\"markdown\":\"![mock](mock.png)\",\"revised_prompt\":null}]"
+            : "[]";
+        string error = state == "failed" ? "{\"message\":\"mock failed\"}" : "null";
+        string json = "{\"version\":1,\"status\":\"" + state + "\",\"command\":\"" + Escape(command) + "\",\"exit_code\":" + exitCode + ",\"saved\":" + saved + ",\"timing_ms\":{\"input_prepare\":0,\"api\":1,\"save\":0,\"total\":1},\"error\":" + error + ",\"request_id\":\"mock-request\"}";
+        File.WriteAllText(path, json, Utf8);
+    }
+
+    public static int Main(string[] args) {
+        string statusFile = Environment.GetEnvironmentVariable("NIUCODES_IMAGEGEN_TEST_STATUS_FILE");
+        string captureFile = Environment.GetEnvironmentVariable("NIUCODES_IMAGEGEN_TEST_CAPTURE_FILE");
+        string historyFile = Environment.GetEnvironmentVariable("NIUCODES_IMAGEGEN_TEST_HISTORY_FILE");
+        string outputFile = Environment.GetEnvironmentVariable("NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE");
+        string mode = Environment.GetEnvironmentVariable("NIUCODES_IMAGEGEN_TEST_MODE");
+        string command = args.Length > 0 ? args[0] : "generate";
+
+        File.WriteAllLines(captureFile, args, Utf8);
+        WriteStatus(statusFile, command, "running", 0, null);
+        File.WriteAllText(historyFile, "running", Utf8);
+        if (mode == "slow") {
+            Thread.Sleep(4000);
+            return 0;
+        }
+        Thread.Sleep(150);
+        if (mode == "failed") {
+            WriteStatus(statusFile, command, "failed", 7, null);
+            return 7;
+        }
+        WriteStatus(statusFile, command, "success", 0, outputFile);
+        File.AppendAllText(historyFile, ",success", Utf8);
+        return 0;
+    }
+}
+'@ -OutputAssembly $mockExecutable -OutputType ConsoleApplication
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -25,42 +75,6 @@ function Invoke-RunnerCase([string]$Mode, [int]$TimeoutSeconds = 5, [bool]$UseSi
     $captureFile = Join-Path $caseRoot "captured args.json"
     $historyFile = Join-Path $caseRoot "status history.txt"
     $outputFile = Join-Path $caseRoot "output image.png"
-    $mockFile = Join-Path $caseRoot "mock imagegen.ps1"
-    $mockCommand = Join-Path $caseRoot "mock imagegen.cmd"
-    @'
-param([string]$MockMode)
-$ErrorActionPreference = "Stop"
-function Write-Status([string]$Path, [string]$State, [int]$ExitCode) {
-    $payload = [ordered]@{
-        version = 1; status = $State; command = $args[0]; exit_code = $ExitCode
-        saved = @(); timing_ms = @{ input_prepare = 0; api = 1; save = 0; total = 1 }
-        error = if ($State -eq "failed") { @{ message = "mock failed" } } else { $null }
-        request_id = "mock-request"
-    }
-    [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Compress -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
-}
-$statusFile = $env:NIUCODES_IMAGEGEN_TEST_STATUS_FILE
-$captureFile = $env:NIUCODES_IMAGEGEN_TEST_CAPTURE_FILE
-$historyFile = $env:NIUCODES_IMAGEGEN_TEST_HISTORY_FILE
-$outputFile = $env:NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE
-[System.IO.File]::WriteAllText($captureFile, ($args | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
-Write-Status $statusFile "running" 0
-[System.IO.File]::WriteAllText($historyFile, "running", (New-Object System.Text.UTF8Encoding($false)))
-if ($MockMode -eq "slow") { Start-Sleep -Seconds 4; exit 0 }
-Start-Sleep -Milliseconds 150
-if ($MockMode -eq "failed") { Write-Status $statusFile "failed" 7; exit 7 }
-$payload = Get-Content -LiteralPath $statusFile -Raw | ConvertFrom-Json
-$payload.status = "success"; $payload.exit_code = 0
-$payload.saved = @(@{ index = 0; absolute_path = $outputFile; markdown_path = "mock.png"; markdown = "![mock](mock.png)"; revised_prompt = $null })
-[System.IO.File]::WriteAllText($statusFile, ($payload | ConvertTo-Json -Compress -Depth 8), (New-Object System.Text.UTF8Encoding($false)))
-[System.IO.File]::AppendAllText($historyFile, ",success", (New-Object System.Text.UTF8Encoding($false)))
-exit 0
-'@ | Set-Content -LiteralPath $mockFile -Encoding UTF8
-    @"
-@echo off
-"$hostExe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0mock imagegen.ps1" -MockMode "$Mode" --% %*
-"@ | Set-Content -LiteralPath $mockCommand -Encoding ASCII
-
     $prompt = '中文 prompt with spaces and "quoted text"'
     $promptFlag = if ($UseSingleDashAliases) { "-Prompt" } else { "--prompt" }
     $outputFlag = if ($UseSingleDashAliases) { "-Output" } else { "--output" }
@@ -70,7 +84,7 @@ exit 0
     $runnerArguments = @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner,
         "generate", "--status-file", $statusFile, "--timeout-seconds", $TimeoutSeconds,
-        "-ExecutablePath", $mockCommand,
+        "-ExecutablePath", $mockExecutable,
         $promptFlag, $prompt,
         $outputFlag, $outputFile, $qualityFlag, "low", $sizeFlag, "1024x1024", $overwriteFlag, "true"
     )
@@ -79,6 +93,7 @@ exit 0
         "NIUCODES_IMAGEGEN_TEST_CAPTURE_FILE" = $captureFile
         "NIUCODES_IMAGEGEN_TEST_HISTORY_FILE" = $historyFile
         "NIUCODES_IMAGEGEN_TEST_OUTPUT_FILE" = $outputFile
+        "NIUCODES_IMAGEGEN_TEST_MODE" = $Mode
     }
     $previousEnvironment = @{}
     foreach ($entry in $testEnvironment.GetEnumerator()) {
@@ -97,7 +112,7 @@ exit 0
         exit_code = $exitCode
         result = Get-Content -LiteralPath $stdoutFile -Raw -Encoding UTF8 | ConvertFrom-Json
         status = Get-Content -LiteralPath $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        captured = Get-Content -LiteralPath $captureFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        captured = @(Get-Content -LiteralPath $captureFile -Encoding UTF8)
         history = Get-Content -LiteralPath $historyFile -Raw -Encoding UTF8
         stdout = Get-Content -LiteralPath $stdoutFile -Raw -Encoding UTF8
     }
