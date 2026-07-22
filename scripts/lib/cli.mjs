@@ -1,4 +1,4 @@
-import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
@@ -20,10 +20,12 @@ import {
 const HELP_TEXT = `niucodes-image-gen
 
 Usage:
+  niucodes-image-gen run --request-file "<absolute-request.json>"
   niucodes-image-gen generate --prompt "..." [options]
   niucodes-image-gen edit --image "<path>" --prompt "..." [options]
 
 Commands:
+  run         Execute one structured request file. This is the supported skill entrypoint.
   generate    Call /v1/images/generations through the official OpenAI Node SDK.
   edit        Call /v1/images/edits through the official OpenAI Node SDK.
 
@@ -55,6 +57,29 @@ Display rule:
   VS Code surfaces, and similar clients can render the saved local image files.
 
 `;
+
+const REQUEST_FIELDS = new Set([
+  "version",
+  "command",
+  "statusFile",
+  "prompt",
+  "output",
+  "image",
+  "mask",
+  "quality",
+  "size",
+  "model",
+  "outputFormat",
+  "background",
+  "moderation",
+  "n",
+  "overwrite",
+  "timeoutMs",
+  "verboseResponse",
+  "inputFidelity",
+  "outputCompression",
+  "user",
+]);
 
 function parseArgumentValue(rawValue) {
   if (rawValue === undefined) {
@@ -236,6 +261,26 @@ async function writeStatusFile(statusFile, payload) {
   await rename(temporaryPath, statusFile);
 }
 
+async function readStatusFile(statusFile) {
+  if (!statusFile) return undefined;
+  try {
+    const parsed = JSON.parse(await readFile(statusFile, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseRequestFile(contents, requestPath) {
+  // Windows PowerShell 5.1 commonly writes UTF-8 JSON with a BOM.
+  const json = contents.charCodeAt(0) === 0xfeff ? contents.slice(1) : contents;
+  try {
+    return JSON.parse(json);
+  } catch {
+    throw new Error(`Invalid JSON request file: ${requestPath}`);
+  }
+}
+
 function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, exitCode = null, stage }) {
   return {
     version: 1,
@@ -251,6 +296,106 @@ function lifecyclePayload({ command, status, startedAt, timing, saved = [], erro
     ...(stage ? { stage } : {}),
     ...(error ? { error } : {}),
   };
+}
+
+function toRequestObject(rawRequest, requestPath) {
+  if (!rawRequest || typeof rawRequest !== "object" || Array.isArray(rawRequest)) {
+    throw new Error(`Request file must contain a JSON object: ${requestPath}`);
+  }
+
+  const request = Object.fromEntries(Object.entries(rawRequest).map(([key, value]) => [
+    key.replace(/[_-]([a-z])/gi, (_, char) => char.toUpperCase()),
+    value,
+  ]));
+  if (request.apiKey !== undefined || request.config !== undefined) {
+    throw new Error("Request files cannot contain apiKey or config. Use the package-root config.json.");
+  }
+  const unsupported = Object.keys(request).find((key) => !REQUEST_FIELDS.has(key));
+  if (unsupported) throw new Error(`Unsupported request field: ${unsupported}`);
+  if (request.version !== 1) throw new Error("Request file version must be 1.");
+  if (!["generate", "edit"].includes(request.command)) {
+    throw new Error("Request command must be generate or edit.");
+  }
+  if (typeof request.statusFile !== "string" || !path.isAbsolute(request.statusFile)) {
+    throw new Error("Request statusFile must be an absolute path.");
+  }
+  if (typeof request.output !== "string" || !path.isAbsolute(request.output)) {
+    throw new Error("Request output must be an absolute path.");
+  }
+  if (request.mask !== undefined && (typeof request.mask !== "string" || !path.isAbsolute(request.mask))) {
+    throw new Error("Request mask must be an absolute path.");
+  }
+  if (request.image !== undefined) {
+    const images = Array.isArray(request.image) ? request.image : [request.image];
+    if (!images.every((image) => typeof image === "string" && path.isAbsolute(image))) {
+      throw new Error("Request image must contain only absolute paths.");
+    }
+  }
+
+  const { command, statusFile, version, ...options } = request;
+  return {
+    command,
+    options: {
+      image: [],
+      ...options,
+      statusFile: path.resolve(statusFile),
+    },
+  };
+}
+
+function requestFailurePayload(command, message, startedAt, startedAtPerformance) {
+  return lifecyclePayload({
+    command,
+    status: "failed",
+    startedAt,
+    timing: { total: Math.round(performance.now() - startedAtPerformance) },
+    exitCode: 1,
+    stage: "initialization",
+    error: { message },
+  });
+}
+
+async function runRequestFile(argv, { cwd = process.cwd() } = {}) {
+  const startedAt = new Date().toISOString();
+  const startedAtPerformance = performance.now();
+  let statusFile;
+  let command = "run";
+
+  try {
+    if (argv.length !== 2 || argv[0] !== "--request-file" || !argv[1]) {
+      throw new Error("Usage: niucodes-image-gen run --request-file <absolute-request.json>");
+    }
+    if (!path.isAbsolute(argv[1])) {
+      throw new Error("Request file must be an absolute path.");
+    }
+    const requestPath = path.resolve(argv[1]);
+    const rawRequest = parseRequestFile(await readFile(requestPath, "utf8"), requestPath);
+    if (rawRequest && typeof rawRequest === "object" && !Array.isArray(rawRequest)
+      && typeof rawRequest.statusFile === "string" && path.isAbsolute(rawRequest.statusFile)) {
+      statusFile = path.resolve(rawRequest.statusFile);
+    }
+    const request = toRequestObject(rawRequest, requestPath);
+    command = request.command;
+    statusFile = request.options.statusFile;
+    const payload = await executeImageCommand(command, request.options, { cwd });
+    const finalPayload = await readStatusFile(statusFile) ?? payload;
+    await writeStdout(`${stableStringify(finalPayload)}\n`);
+    return 0;
+  } catch (error) {
+    const message = formatOpenAIError(error);
+    let payload = await readStatusFile(statusFile);
+    if (!payload || !["success", "failed"].includes(payload.status)) {
+      payload = requestFailurePayload(command, message, startedAt, startedAtPerformance);
+      try {
+        await writeStatusFile(statusFile, payload);
+      } catch (statusError) {
+        await writeStderr(`Unable to write status file: ${formatOpenAIError(statusError)}\n`);
+      }
+    }
+    await writeStderr(`${message}\n`);
+    await writeStdout(`${stableStringify(payload)}\n`);
+    return Number.isInteger(payload.exit_code) && payload.exit_code !== 0 ? payload.exit_code : 1;
+  }
 }
 
 export async function executeImageCommand(command, options, { cwd = process.cwd() } = {}) {
@@ -340,6 +485,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
 }
 
 export async function runCli(argv, { cwd = process.cwd() } = {}) {
+  if (argv[0] === "run") {
+    return runRequestFile(argv.slice(1), { cwd });
+  }
   const parsed = parseArgs(argv);
   if (parsed.help) {
     await writeStdout(`${HELP_TEXT}\n`);
@@ -351,4 +499,4 @@ export async function runCli(argv, { cwd = process.cwd() } = {}) {
   return 0;
 }
 
-export { HELP_TEXT, parseArgs };
+export { HELP_TEXT, parseArgs, runRequestFile, toRequestObject };

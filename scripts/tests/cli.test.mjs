@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -20,8 +20,6 @@ import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs"
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(".");
 const scriptPath = path.join(repoRoot, "scripts", "niucodes-image-gen.mjs");
-const windowsRunnerPath = path.join(repoRoot, "scripts", "invoke-imagegen.ps1");
-const macosRunnerPath = path.join(repoRoot, "scripts", "invoke-imagegen.sh");
 const macosArm64BinaryPath = path.join(repoRoot, "bin", "niucodes-image-gen-macos-arm64");
 const fixturePngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
 const tempDirectories = [];
@@ -40,6 +38,15 @@ async function createTempDir() {
 async function writePng(filePath) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, Buffer.from(fixturePngBase64, "base64"));
+}
+
+async function exists(filePath) {
+  try {
+    await stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function withMockServer(handler, run) {
@@ -66,13 +73,12 @@ test("skill uses a root config file and has no stored key or key setter flow", a
   assert.doesNotMatch(skill, /set-skill-api-key|OPENAI_API_KEY|API_KEY:/i);
 });
 
-test("skill uses its bundled local runner and does not prescribe MCP", async () => {
+test("skill uses its bundled native request-file entrypoint and does not prescribe MCP", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
-  assert.match(skill, /bundled local runner/i);
-  assert.match(skill, /invoke-imagegen\.sh/);
-  assert.match(skill, /invoke-imagegen\.ps1/);
-  assert.match(skill, /timeout-seconds 600/i);
-  assert.match(skill, /do not interrupt the local process/i);
+  assert.match(skill, /bundled native executable/i);
+  assert.match(skill, /run --request-file/i);
+  assert.match(skill, /do not interrupt the native executable/i);
+  assert.doesNotMatch(skill, /invoke-imagegen\.sh|invoke-imagegen\.ps1/);
   assert.doesNotMatch(skill, /imagegen_generate|imagegen_edit|native MCP/i);
   assert.doesNotMatch(await readFile(scriptPath, "utf8"), /runMcpServer|mcp-server/);
 });
@@ -84,26 +90,6 @@ test("Windows installation entrypoint runs the bundled executable in install mod
   assert.match(installer, /Restart Codex Desktop/i);
 });
 
-test("Windows runner atomically replaces status files without File.Replace", async () => {
-  const runner = await readFile(windowsRunnerPath, "utf8");
-  assert.match(runner, /MoveFileEx/);
-  assert.match(runner, /MOVEFILE_REPLACE_EXISTING/);
-  assert.doesNotMatch(runner, /\[System\.IO\.File\]::Replace/);
-  assert.match(runner, /function Normalize-ImageArguments/);
-  assert.match(runner, /"-prompt"\s*=\s*"--prompt"/);
-  assert.match(runner, /"-output"\s*=\s*"--output"/);
-  assert.match(runner, /\[Parameter\(ValueFromRemainingArguments = \$true\)\]/);
-  assert.match(runner, /\[string\[\]\]\$ImageArguments/);
-  assert.doesNotMatch(runner, /\[string\]\$Prompt/);
-  assert.doesNotMatch(runner, /\[string\]\$Config/);
-  assert.doesNotMatch(runner, /function Add-ImageOption/);
-  assert.match(runner, /\$null -eq \$Arguments -or \$Arguments\.Count -eq 0/);
-  assert.match(runner, /foreach \(\$argument in @\(Normalize-ImageArguments \$ImageArguments\)\)/);
-  assert.doesNotMatch(runner, /\.AddRange\(/);
-  assert.match(runner, /\$timedOut = \$true/);
-  assert.match(runner, /if \(\$timedOut\) \{ \$childExitCode = 124 \}/);
-});
-
 test("legacy MCP config removal preserves unrelated server configuration", () => {
   const initial = '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n';
   const updated = removeLegacyMcpServerConfig(initial);
@@ -111,35 +97,37 @@ test("legacy MCP config removal preserves unrelated server configuration", () =>
   assert.doesNotMatch(updated, /\[mcp_servers\.niucodes_image_gen\]/);
 });
 
-test("installer copies runners, preserves API config, and removes legacy MCP config", async () => {
+test("installer copies the native executable, preserves API config, and removes legacy MCP config", async () => {
   const tempDir = await createTempDir();
   const sourceRoot = path.join(tempDir, "source skill");
   const installDir = path.join(tempDir, "installed skill");
   const configPath = path.join(tempDir, "codex", "config.toml");
   await mkdir(path.join(sourceRoot, "bin"), { recursive: true });
-  await mkdir(path.join(sourceRoot, "scripts"), { recursive: true });
   await writeFile(path.join(sourceRoot, "SKILL.md"), "---\nname: niucodes-image-gen\ndescription: test\n---\n");
   await writeFile(path.join(sourceRoot, "config.json"), '{"apiKey":"template-key"}');
   await writeFile(path.join(sourceRoot, "bin", "niucodes-image-gen-macos-arm64"), "binary");
-  await writeFile(path.join(sourceRoot, "scripts", "invoke-imagegen.sh"), "#!/bin/bash\n");
-  await writeFile(path.join(sourceRoot, "scripts", "invoke-imagegen.ps1"), "# runner\n");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved-key"}');
+  await mkdir(path.join(installDir, "scripts"), { recursive: true });
+  await writeFile(path.join(installDir, "scripts", "invoke-imagegen.ps1"), "legacy runner");
+  await writeFile(path.join(installDir, "scripts", "invoke-imagegen.sh"), "legacy runner");
   await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
   const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
   assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
-  assert.equal(result.runner, path.join(installDir, "scripts", "invoke-imagegen.sh"));
+  assert.equal(result.protocol, "request-file-v1");
   assert.equal(result.removed_legacy_mcp_config, true);
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved-key"}');
+  assert.equal(await exists(path.join(installDir, "scripts", "invoke-imagegen.ps1")), false);
+  assert.equal(await exists(path.join(installDir, "scripts", "invoke-imagegen.sh")), false);
   const codexConfig = await readFile(configPath, "utf8");
   assert.match(codexConfig, /\[mcp_servers\.other\]/);
   assert.doesNotMatch(codexConfig, /\[mcp_servers\.niucodes_image_gen\]/);
 });
 
-test("Apple Silicon installer deploys the runner and removes legacy MCP config", { skip: process.platform !== "darwin" }, async () => {
+test("Apple Silicon installation resolves the native entrypoint and removes legacy MCP config", async () => {
   const tempDir = await createTempDir();
   const installDir = path.join(tempDir, "installed skill");
   const configPath = path.join(tempDir, "codex config", "config.toml");
@@ -148,96 +136,12 @@ test("Apple Silicon installer deploys the runner and removes legacy MCP config",
   await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, '[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
-  const { stdout, stderr } = await execFileAsync(macosArm64BinaryPath, [
-    "install", "--install-dir", installDir, "--config-path", configPath,
-  ]);
-  const result = JSON.parse(stdout);
-  assert.equal(stderr, "");
+  const result = await installSkill({ packageRoot: repoRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
-  assert.equal(result.runner, path.join(installDir, "scripts", "invoke-imagegen.sh"));
-  assert.match(await readFile(result.runner, "utf8"), /TIMEOUT_SECONDS=600/);
+  assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
+  assert.equal(result.protocol, "request-file-v1");
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved"}');
   assert.doesNotMatch(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
-});
-
-test("macOS runner waits locally and emits one final status JSON", { skip: process.platform !== "darwin" }, async () => {
-  const tempDir = await createTempDir();
-  const statusPath = path.join(tempDir, "status with spaces.json");
-  const mockExecutable = path.join(tempDir, "mock image binary.sh");
-  await writeFile(mockExecutable, `#!/bin/bash
-status_file=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--status-file" ]; then status_file="$2"; shift 2; else shift; fi
-done
-printf '%s\\n' '{"status":"running","command":"generate","exit_code":null,"saved":[],"timing_ms":{},"error":null,"request_id":null}' > "$status_file"
-sleep 0.05
-printf '%s\\n' '{"status":"success","command":"generate","exit_code":0,"saved":[{"absolute_path":"/tmp/output image.png"}],"timing_ms":{"input_prepare":0,"api":50,"save":0,"total":50},"error":null,"request_id":"mock-request"}' > "$status_file"
-printf '%s\\n' 'child stdout must not be forwarded'
-`);
-  await (await import("node:fs/promises")).chmod(mockExecutable, 0o755);
-
-  const { stdout, stderr } = await execFileAsync("/bin/bash", [
-    macosRunnerPath,
-    "generate",
-    "--status-file", statusPath,
-    "--timeout-seconds", "5",
-    "--executable-path", mockExecutable,
-    "--prompt", "中文 prompt with spaces and \\\"quotes\\\"",
-    "--output", path.join(tempDir, "output image.png"),
-  ]);
-  assert.equal(stderr, "");
-  const result = JSON.parse(stdout);
-  assert.equal(result.status, "success");
-  assert.equal(result.exit_code, 0);
-  assert.equal(result.request_id, "mock-request");
-  assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
-  assert.doesNotMatch(stdout, /child stdout/);
-});
-
-test("macOS runner preserves failed and timeout result contracts", { skip: process.platform !== "darwin" }, async () => {
-  const tempDir = await createTempDir();
-  const failedStatusPath = path.join(tempDir, "failed.status.json");
-  const failedExecutable = path.join(tempDir, "failed binary.sh");
-  await writeFile(failedExecutable, `#!/bin/bash
-while [ "$1" != "--status-file" ]; do shift; done
-printf '%s\\n' '{"status":"failed","command":"edit","exit_code":1,"saved":[],"timing_ms":{"total":7},"error":{"message":"mock failure"},"request_id":null}' > "$2"
-exit 1
-`);
-  await (await import("node:fs/promises")).chmod(failedExecutable, 0o755);
-
-  await assert.rejects(
-    execFileAsync("/bin/bash", [macosRunnerPath, "edit", "--status-file", failedStatusPath, "--executable-path", failedExecutable]),
-    (error) => {
-      const result = JSON.parse(error.stdout);
-      assert.equal(error.code, 1);
-      assert.equal(result.status, "failed");
-      assert.equal(result.error.message, "mock failure", JSON.stringify(result));
-      return true;
-    },
-  );
-
-  const timeoutStatusPath = path.join(tempDir, "timeout.status.json");
-  const timeoutExecutable = path.join(tempDir, "slow binary.sh");
-  await writeFile(timeoutExecutable, `#!/bin/bash
-while [ "$1" != "--status-file" ]; do shift; done
-printf '%s\\n' '{"status":"running","command":"generate","exit_code":null,"saved":[],"timing_ms":{},"error":null,"request_id":null}' > "$2"
-sleep 10
-`);
-  await (await import("node:fs/promises")).chmod(timeoutExecutable, 0o755);
-
-  let timeoutError;
-  try {
-    await execFileAsync("/bin/bash", [macosRunnerPath, "generate", "--status-file", timeoutStatusPath, "--timeout-seconds", "1", "--executable-path", timeoutExecutable]);
-  } catch (error) {
-    timeoutError = error;
-  }
-  assert.ok(timeoutError);
-  const timeoutResult = JSON.parse(timeoutError.stdout);
-  assert.equal(timeoutError.code, 124);
-  assert.equal(timeoutResult.status, "failed");
-  assert.equal(timeoutResult.exit_code, 124);
-  assert.match(timeoutResult.error.message, /Timed out/);
-  assert.deepEqual(JSON.parse(await readFile(timeoutStatusPath, "utf8")), timeoutResult);
 });
 
 test("generate forwards prompt verbatim and reads the key only from config.json", async () => {
@@ -269,6 +173,136 @@ test("generate forwards prompt verbatim and reads the key only from config.json"
     assert.equal(typeof result.timing_ms.api, "number");
     assert.equal(typeof result.timing_ms.save, "number");
     assert.equal(typeof result.timing_ms.total, "number");
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+  });
+});
+
+test("request-file executes generate and edit without image command-line arguments", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const sourcePath = path.join(tempDir, "source image.png");
+  const generateOutput = path.join(tempDir, "outputs with spaces", "generated.png");
+  const editOutput = path.join(tempDir, "outputs with spaces", "edited.png");
+  const generateStatus = path.join(tempDir, "statuses", "generate.json");
+  const editStatus = path.join(tempDir, "statuses", "edit.json");
+  const generateRequest = path.join(tempDir, "requests", "generate request.json");
+  const editRequest = path.join(tempDir, "requests", "edit request.json");
+  await mkdir(path.dirname(generateRequest), { recursive: true });
+  await mkdir(skillRoot, { recursive: true });
+  await writePng(sourcePath);
+
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.headers.authorization, "Bearer request-file-key");
+    if (req.url === "/v1/images/generations") {
+      const payload = JSON.parse(body);
+      assert.equal(payload.prompt, '中文 prompt with spaces and "quotes"');
+    } else {
+      assert.equal(req.url, "/v1/images/edits");
+      assert.match(req.headers["content-type"], /^multipart\/form-data/);
+      assert.match(body.toString("latin1"), /keep the image and change the scarf/);
+    }
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "request-file-key", baseURL }));
+    await writeFile(generateRequest, JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: generateStatus,
+      prompt: '中文 prompt with spaces and "quotes"',
+      output: generateOutput,
+      quality: "low",
+      size: "1024x1024",
+      overwrite: true,
+    }));
+    const generated = await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", generateRequest], {
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    });
+    const generateResult = JSON.parse(generated.stdout);
+    assert.equal(generated.stderr, "");
+    assert.equal(generateResult.status, "success");
+    assert.deepEqual(JSON.parse(await readFile(generateStatus, "utf8")), generateResult);
+    assert.equal((await readFile(generateOutput)).toString("base64"), fixturePngBase64);
+
+    await writeFile(editRequest, JSON.stringify({
+      version: 1,
+      command: "edit",
+      statusFile: editStatus,
+      prompt: "keep the image and change the scarf",
+      image: [sourcePath],
+      output: editOutput,
+      quality: "low",
+      size: "1024x1024",
+      overwrite: true,
+    }));
+    const edited = await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", editRequest], {
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    });
+    const editResult = JSON.parse(edited.stdout);
+    assert.equal(edited.stderr, "");
+    assert.equal(editResult.status, "success");
+    assert.deepEqual(JSON.parse(await readFile(editStatus, "utf8")), editResult);
+    assert.equal((await readFile(editOutput)).toString("base64"), fixturePngBase64);
+  });
+});
+
+test("request-file failures return JSON without exposing credentials", async () => {
+  const tempDir = await createTempDir();
+  const requestPath = path.join(tempDir, "invalid request.json");
+  const statusPath = path.join(tempDir, "invalid status.json");
+  await writeFile(requestPath, JSON.stringify({
+    version: 1,
+    command: "generate",
+    statusFile: statusPath,
+    prompt: "test",
+    output: path.join(tempDir, "output.png"),
+    apiKey: "must-not-leak",
+  }));
+  let failure;
+  try {
+    await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", requestPath]);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  const result = JSON.parse(failure.stdout);
+  assert.equal(failure.code, 1);
+  assert.equal(result.status, "failed");
+  assert.match(result.error.message, /cannot contain apiKey/);
+  assert.doesNotMatch(`${failure.stdout}${failure.stderr}`, /must-not-leak/);
+  assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+});
+
+test("request-file accepts a Windows UTF-8 BOM and keeps user data out of argv", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const outputPath = path.join(tempDir, "output folder", "generated image.png");
+  const statusPath = path.join(tempDir, "status folder", "generated status.json");
+  const requestPath = path.join(tempDir, "request folder", "generate request.json");
+  await mkdir(path.dirname(requestPath), { recursive: true });
+  await mkdir(skillRoot, { recursive: true });
+
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.url, "/v1/images/generations");
+    assert.equal(JSON.parse(body).prompt, '中文 prompt with spaces and "quotes"');
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "bom-test-key", baseURL }));
+    await writeFile(requestPath, `\uFEFF${JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: '中文 prompt with spaces and "quotes"',
+      output: outputPath,
+      overwrite: true,
+    })}`);
+    const { stdout, stderr } = await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", requestPath], {
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    });
+    assert.equal(stderr, "");
+    const result = JSON.parse(stdout);
+    assert.equal(result.status, "success");
     assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
   });
 });

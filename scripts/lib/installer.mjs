@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -60,8 +60,6 @@ async function copyRuntimePackage(packageRoot, installDir) {
     "SKILL.md",
     path.join("agents", "openai.yaml"),
     path.join(".codex-plugin", "plugin.json"),
-    path.join("scripts", "invoke-imagegen.sh"),
-    path.join("scripts", "invoke-imagegen.ps1"),
   ];
   for (const relativePath of staticFiles) {
     await copyIfPresent(path.join(packageRoot, relativePath), path.join(installDir, relativePath));
@@ -72,6 +70,13 @@ async function copyRuntimePackage(packageRoot, installDir) {
   if (!(await exists(targetConfig))) {
     await copyIfPresent(sourceConfig, targetConfig);
   }
+}
+
+async function removeLegacyRunners(installDir) {
+  await Promise.all([
+    rm(path.join(installDir, "scripts", "invoke-imagegen.ps1"), { force: true }),
+    rm(path.join(installDir, "scripts", "invoke-imagegen.sh"), { force: true }),
+  ]);
 }
 
 export async function installSkill({
@@ -86,17 +91,11 @@ export async function installSkill({
   if (sourceRoot !== targetRoot) {
     await copyRuntimePackage(sourceRoot, targetRoot);
   }
+  await removeLegacyRunners(targetRoot);
   const executable = selectPlatformBinary({ platform, arch, skillRoot: targetRoot });
   if (!(await exists(executable))) {
     throw new Error(`Installed executable was not found: ${executable}`);
   }
-  const runner = platform === "win32"
-    ? path.join(targetRoot, "scripts", "invoke-imagegen.ps1")
-    : path.join(targetRoot, "scripts", "invoke-imagegen.sh");
-  if (!(await exists(runner))) {
-    throw new Error(`Installed local runner was not found: ${runner}`);
-  }
-
   let removedLegacyMcpConfig = false;
   if (await exists(configPath)) {
     const currentConfig = await readFile(configPath, "utf8");
@@ -111,7 +110,7 @@ export async function installSkill({
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
     executable,
-    runner,
+    protocol: "request-file-v1",
     removed_legacy_mcp_config: removedLegacyMcpConfig,
     restart_required: true,
   };

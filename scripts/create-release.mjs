@@ -17,8 +17,6 @@ const sharedFiles = [
   path.join("agents", "openai.yaml"),
   path.join(".codex-plugin", "plugin.json"),
   "INSTALL.txt",
-  path.join("scripts", "invoke-imagegen.sh"),
-  path.join("scripts", "invoke-imagegen.ps1"),
 ];
 
 const platforms = [
@@ -56,7 +54,6 @@ async function makePackage(destinationRoot, selectedPlatforms) {
     if (platform.id.startsWith("macos")) {
       await chmod(path.join(destinationRoot, "bin", platform.binary), 0o755);
       await chmod(path.join(destinationRoot, "scripts", platform.installer), 0o755);
-      await chmod(path.join(destinationRoot, "scripts", "invoke-imagegen.sh"), 0o755);
     }
   }
 }

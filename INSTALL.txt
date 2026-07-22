@@ -8,4 +8,4 @@ NiuCodes Image Gen installation
 3. Restart Codex Desktop.
 
 No Node.js, Python, PowerShell, or OpenAI SDK installation is required.
-The installer creates ~/.codex/skills/niucodes-image-gen, installs the local runners, and removes this skill's legacy MCP registration.
+The installer creates ~/.codex/skills/niucodes-image-gen, installs the native executable, and removes this skill's legacy MCP registration.
