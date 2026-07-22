@@ -12,10 +12,14 @@
     "test:package-e2e": "node scripts/tests/packaged-e2e.mjs",
     "bundle:bin:mac": "esbuild scripts/niucodes-image-gen.mjs --bundle --platform=node --format=cjs --target=node22 --outfile=build/niucodes-image-gen-mac.cjs",
     "bundle:bin:win": "esbuild scripts/niucodes-image-gen.mjs --bundle --platform=node --format=cjs --target=node18 --outfile=build/niucodes-image-gen-win.cjs",
-    "build:bin:mac": "npm run bundle:bin:mac && pkg --compress GZip --targets node22-macos-arm64 --output bin/niucodes-image-gen-macos-arm64 build/niucodes-image-gen-mac.cjs && pkg --compress GZip --targets node22-macos-x64 --output bin/niucodes-image-gen-macos-x64 build/niucodes-image-gen-mac.cjs",
-    "build:bin:win": "npm run bundle:bin:win && pkg --compress None --public --no-bytecode --targets node18-win-x64 --output bin/niucodes-image-gen-win-x64.exe build/niucodes-image-gen-win.cjs",
-    "build:bin": "npm run build:bin:mac && npm run build:bin:win",
-    "build:release": "npm run build:bin && node scripts/create-release.mjs"
+    "build:bin:macos-arm64": "npm run bundle:bin:mac && pkg --compress GZip --targets node22-macos-arm64 --output bin/niucodes-image-gen-macos-arm64 build/niucodes-image-gen-mac.cjs",
+    "build:bin:macos-x64": "npm run bundle:bin:mac && pkg --compress GZip --targets node22-macos-x64 --output bin/niucodes-image-gen-macos-x64 build/niucodes-image-gen-mac.cjs",
+    "build:bin:win-x64": "npm run bundle:bin:win && pkg --compress None --public --no-bytecode --targets node18-win-x64 --output bin/niucodes-image-gen-win-x64.exe build/niucodes-image-gen-win.cjs",
+    "build:package:macos-arm64": "npm run build:bin:macos-arm64 && node scripts/create-release.mjs --platform macos-arm64",
+    "build:package:macos-x64": "npm run build:bin:macos-x64 && node scripts/create-release.mjs --platform macos-x64",
+    "build:package:win-x64": "npm run build:bin:win-x64 && node scripts/create-release.mjs --platform win-x64",
+    "build:release": "npm run build:bin:macos-arm64 && npm run build:bin:macos-x64 && npm run build:bin:win-x64 && node scripts/create-release.mjs",
+    "assemble:release": "node scripts/assemble-release.mjs"
   },
   "dependencies": {
     "openai": "^6.44.0"

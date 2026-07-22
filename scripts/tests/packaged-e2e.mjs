@@ -56,6 +56,17 @@ async function runNative(executable, requestFile) {
   });
 }
 
+async function runNativeInstall(executable, installDir, configPath) {
+  return execFileAsync(executable, [
+    "install",
+    "--install-dir", installDir,
+    "--config-path", configPath,
+  ], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
 async function withMockImagesApi(handler, run) {
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -99,8 +110,19 @@ const generateStatus = path.join(testRoot, "status folder", "generate status.jso
 const editStatus = path.join(testRoot, "status folder", "edit status.json");
 const generateRequest = path.join(testRoot, "request folder", "generate request.json");
 const editRequest = path.join(testRoot, "request folder", "edit request.json");
+const installedSkill = path.join(testRoot, "installed skill 中文");
+const installedConfigPath = path.join(testRoot, "codex config", "config.toml");
+const installedOutput = path.join(testRoot, "installed output", "generated after install.png");
+const installedStatus = path.join(testRoot, "installed status", "generated after install.json");
+const installedRequest = path.join(testRoot, "installed request", "request.json");
 await mkdir(path.dirname(generateRequest), { recursive: true });
+await mkdir(path.join(installedSkill, "scripts"), { recursive: true });
+await mkdir(path.dirname(installedConfigPath), { recursive: true });
 await writeFile(sourceImage, Buffer.from(fixturePngBase64, "base64"));
+await writeFile(path.join(installedSkill, "config.json"), JSON.stringify({ apiKey: "packaged-e2e-key", baseURL: "will-be-replaced" }));
+await writeFile(path.join(installedSkill, "scripts", "invoke-imagegen.ps1"), "legacy runner");
+await writeFile(path.join(installedSkill, "scripts", "invoke-imagegen.sh"), "legacy runner");
+await writeFile(installedConfigPath, '[mcp_servers.niucodes_image_gen]\ncommand = "legacy"\n');
 
 let requestCount = 0;
 await withMockImagesApi(async (request, response, body) => {
@@ -108,7 +130,10 @@ await withMockImagesApi(async (request, response, body) => {
   assert.equal(request.headers.authorization, "Bearer packaged-e2e-key");
   if (request.url === "/v1/images/generations") {
     const payload = JSON.parse(body);
-    assert.equal(payload.prompt, '中文生成 prompt with spaces and "quotes"');
+    assert.ok([
+      '中文生成 prompt with spaces and "quotes"',
+      'installed package prompt with spaces and "quotes"',
+    ].includes(payload.prompt));
   } else {
     assert.equal(request.url, "/v1/images/edits");
     assert.match(request.headers["content-type"], /^multipart\/form-data/);
@@ -142,7 +167,28 @@ await withMockImagesApi(async (request, response, body) => {
     overwrite: true,
   }));
   await assertSuccessfulRequest(executable, editRequest, editStatus, editedImage);
+
+  const installResult = JSON.parse((await runNativeInstall(executable, installedSkill, installedConfigPath)).stdout);
+  assert.equal(installResult.status, "success");
+  assert.equal(installResult.protocol, "request-file-v1");
+  assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.ps1")), false);
+  assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.sh")), false);
+  assert.doesNotMatch(await readFile(installedConfigPath, "utf8"), /niucodes_image_gen/);
+
+  await mkdir(path.dirname(installedRequest), { recursive: true });
+  await writeFile(path.join(installedSkill, "config.json"), JSON.stringify({ apiKey: "packaged-e2e-key", baseURL }));
+  await writeFile(installedRequest, JSON.stringify({
+    version: 1,
+    command: "generate",
+    statusFile: installedStatus,
+    prompt: 'installed package prompt with spaces and "quotes"',
+    output: installedOutput,
+    quality: "low",
+    size: "1024x1024",
+    overwrite: true,
+  }));
+  await assertSuccessfulRequest(path.join(installedSkill, "bin", binaryName()), installedRequest, installedStatus, installedOutput);
 });
 
-assert.equal(requestCount, 2);
+assert.equal(requestCount, 3);
 process.stdout.write(`${JSON.stringify({ status: "success", platform: `${process.platform}-${process.arch}`, package_root: packageRoot, generate: generatedImage, edit: editedImage })}\n`);

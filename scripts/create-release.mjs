@@ -10,6 +10,12 @@ const releaseDir = path.join(root, "release");
 const packageName = "niucodes-image-gen";
 const packageMetadata = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const version = packageMetadata.version;
+const argv = process.argv.slice(2);
+const platformFlagIndex = argv.indexOf("--platform");
+if (platformFlagIndex !== -1 && (argv.length !== 2 || platformFlagIndex !== 0)) {
+  throw new Error("Usage: node scripts/create-release.mjs [--platform <platform-id>]");
+}
+const requestedPlatform = platformFlagIndex === -1 ? undefined : argv[1];
 
 const sharedFiles = [
   "SKILL.md",
@@ -36,6 +42,13 @@ const platforms = [
     installer: "install-windows.cmd",
   },
 ];
+
+const selectedPlatforms = requestedPlatform === undefined
+  ? platforms
+  : platforms.filter((platform) => platform.id === requestedPlatform);
+if (selectedPlatforms.length === 0) {
+  throw new Error(`Unsupported release platform: ${requestedPlatform}`);
+}
 
 async function copyFile(relativePath, destinationRoot) {
   const source = path.join(root, relativePath);
@@ -70,15 +83,16 @@ async function sha256(fileName) {
 await rm(releaseDir, { recursive: true, force: true });
 await mkdir(releaseDir, { recursive: true });
 
-const fullDirectory = path.join(releaseDir, packageName);
-await makePackage(fullDirectory, platforms);
-
 const archives = [];
-const fullArchive = `${packageName}-v${version}.zip`;
-await zipDirectory(packageName, fullArchive);
-archives.push(fullArchive);
+if (requestedPlatform === undefined) {
+  const fullDirectory = path.join(releaseDir, packageName);
+  await makePackage(fullDirectory, platforms);
+  const fullArchive = `${packageName}-v${version}.zip`;
+  await zipDirectory(packageName, fullArchive);
+  archives.push(fullArchive);
+}
 
-for (const platform of platforms) {
+for (const platform of selectedPlatforms) {
   const directoryName = `${packageName}-${platform.id}`;
   const destination = path.join(releaseDir, directoryName);
   await makePackage(destination, [platform]);
@@ -88,5 +102,7 @@ for (const platform of platforms) {
 }
 
 const checksums = await Promise.all(archives.map(async (archive) => `${await sha256(archive)}  ${archive}`));
-await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${checksums.join("\n")}\n`);
-process.stdout.write(`${JSON.stringify({ status: "success", version, release_dir: releaseDir, archives })}\n`);
+if (requestedPlatform === undefined) {
+  await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${checksums.join("\n")}\n`);
+}
+process.stdout.write(`${JSON.stringify({ status: "success", version, platform: requestedPlatform ?? "all", release_dir: releaseDir, archives })}\n`);

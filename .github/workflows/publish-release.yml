@@ -23,12 +23,15 @@ jobs:
           - id: windows-x64
             runner: windows-latest
             package_dir: niucodes-image-gen-win-x64
+            build_script: build:package:win-x64
           - id: macos-arm64
             runner: macos-14
             package_dir: niucodes-image-gen-macos-arm64
+            build_script: build:package:macos-arm64
           - id: macos-x64
             runner: macos-13
             package_dir: niucodes-image-gen-macos-x64
+            build_script: build:package:macos-x64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,7 +40,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npm run build:release
+      - run: npm run ${{ matrix.build_script }}
       - name: Unpack and test the platform release ZIP
         shell: pwsh
         run: |
@@ -46,6 +49,12 @@ jobs:
           $destination = Join-Path $env:RUNNER_TEMP "niucodes-image-gen release verification"
           Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
           node scripts/tests/packaged-e2e.mjs --package-root (Join-Path $destination "${{ matrix.package_dir }}")
+      - name: Upload verified platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: niucodes-image-gen-${{ matrix.id }}
+          path: release/niucodes-image-gen-${{ matrix.id }}-v*.zip
+          if-no-files-found: error
 
   publish:
     needs: packaged-e2e
@@ -58,8 +67,13 @@ jobs:
           node-version: 22
           cache: npm
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: verified-packages
+          merge-multiple: true
+
       - run: npm ci
-      - run: npm run build:release
+      - run: npm run assemble:release -- --input-dir verified-packages
 
       - name: Upload release assets
         env:
