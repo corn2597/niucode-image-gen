@@ -2,11 +2,25 @@ import { File as BufferFile } from "node:buffer";
 import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import process from "node:process";
 
 import OpenAI, { toFile } from "openai";
 
+export function suppressBufferFileExperimentalWarning(runtime = process) {
+  const emitWarning = runtime?.emitWarning;
+  if (typeof emitWarning !== "function") return;
+
+  runtime.emitWarning = (warning, type, ...rest) => {
+    if (type === "ExperimentalWarning" && String(warning).includes("buffer.File")) return;
+    return emitWarning.call(runtime, warning, type, ...rest);
+  };
+}
+
 // Node 18 exposes File via node:buffer but not consistently as a global.
 if (typeof globalThis.File === "undefined") {
+  // Node 18 emits this warning whenever the SDK creates a multipart File.
+  // The native runner reserves stderr for structured execution diagnostics.
+  suppressBufferFileExperimentalWarning();
   Object.defineProperty(globalThis, "File", {
     configurable: true,
     value: BufferFile,

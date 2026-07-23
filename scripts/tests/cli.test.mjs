@@ -14,6 +14,7 @@ import {
   DEFAULT_GENERATE_SIZE,
   resolveConfigPath,
   resolveInvocation,
+  suppressBufferFileExperimentalWarning,
 } from "../lib/image-client.mjs";
 import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs";
 
@@ -94,6 +95,25 @@ test("legacy MCP config removal preserves unrelated server configuration", () =>
   const updated = removeLegacyMcpServerConfig(initial);
   assert.match(updated, /\[mcp_servers\.other\]/);
   assert.doesNotMatch(updated, /\[mcp_servers\.niucodes_image_gen\]/);
+});
+
+test("suppresses only the Node 18 buffer.File experimental warning", () => {
+  const warnings = [];
+  const runtime = {
+    emitWarning(...args) {
+      warnings.push(args);
+    },
+  };
+  suppressBufferFileExperimentalWarning(runtime);
+
+  runtime.emitWarning("buffer.File is an experimental feature", "ExperimentalWarning");
+  runtime.emitWarning("another experimental feature", "ExperimentalWarning");
+  runtime.emitWarning("buffer.File is an experimental feature", "Warning");
+
+  assert.deepEqual(warnings, [
+    ["another experimental feature", "ExperimentalWarning"],
+    ["buffer.File is an experimental feature", "Warning"],
+  ]);
 });
 
 test("installer copies the native executable, preserves API config, and removes legacy MCP config", async () => {
