@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -36,24 +35,24 @@ async function exists(filePath) {
 }
 
 async function runNative(executable, requestFile) {
-  if (process.platform === "win32") {
-    const scriptPath = fileURLToPath(new URL("./invoke-native-request.ps1", import.meta.url));
-    return execFileAsync("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy", "Bypass",
-      "-File", scriptPath,
-      "-Executable", executable,
-      "-RequestFile", requestFile,
-    ], {
-      encoding: "utf8",
-      windowsHide: true,
-    });
-  }
   return execFileAsync(executable, ["run", "--request-file", requestFile], {
     encoding: "utf8",
     windowsHide: true,
   });
+}
+
+async function findPowerShellScripts(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const matches = [];
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      matches.push(...await findPowerShellScripts(entryPath));
+    } else if (entry.name.toLowerCase().endsWith(".ps1")) {
+      matches.push(entryPath);
+    }
+  }
+  return matches;
 }
 
 async function runNativeInstall(executable, installDir, configPath) {
@@ -95,9 +94,7 @@ async function assertSuccessfulRequest(executable, requestFile, statusFile, outp
 const packageRoot = readPackageRoot(process.argv.slice(2));
 const executable = path.join(packageRoot, "bin", binaryName());
 if (!(await exists(executable))) throw new Error(`Packaged executable was not found: ${executable}`);
-if (await exists(path.join(packageRoot, "scripts", "invoke-imagegen.ps1"))) {
-  throw new Error("Release package must not contain the legacy PowerShell runner.");
-}
+assert.deepEqual(await findPowerShellScripts(packageRoot), [], "Release package must not contain PowerShell scripts.");
 if (await exists(path.join(packageRoot, "scripts", "invoke-imagegen.sh"))) {
   throw new Error("Release package must not contain the legacy shell runner.");
 }
@@ -117,11 +114,14 @@ const installedStatus = path.join(testRoot, "installed status", "generated after
 const installedRequest = path.join(testRoot, "installed request", "request.json");
 await mkdir(path.dirname(generateRequest), { recursive: true });
 await mkdir(path.join(installedSkill, "scripts"), { recursive: true });
+await mkdir(path.join(installedSkill, "bin"), { recursive: true });
 await mkdir(path.dirname(installedConfigPath), { recursive: true });
 await writeFile(sourceImage, Buffer.from(fixturePngBase64, "base64"));
 await writeFile(path.join(installedSkill, "config.json"), JSON.stringify({ apiKey: "packaged-e2e-key", baseURL: "will-be-replaced" }));
 await writeFile(path.join(installedSkill, "scripts", "invoke-imagegen.ps1"), "legacy runner");
 await writeFile(path.join(installedSkill, "scripts", "invoke-imagegen.sh"), "legacy runner");
+await writeFile(path.join(installedSkill, "scripts", "other-legacy-runner.ps1"), "legacy runner");
+await writeFile(path.join(installedSkill, "bin", "obsolete-installer.exe"), "legacy binary");
 await writeFile(installedConfigPath, '[mcp_servers.niucodes_image_gen]\ncommand = "legacy"\n');
 
 let requestCount = 0;
@@ -173,6 +173,8 @@ await withMockImagesApi(async (request, response, body) => {
   assert.equal(installResult.protocol, "request-file-v1");
   assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.ps1")), false);
   assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.sh")), false);
+  assert.equal(await exists(path.join(installedSkill, "scripts")), false);
+  assert.equal(await exists(path.join(installedSkill, "bin", "obsolete-installer.exe")), false);
   assert.doesNotMatch(await readFile(installedConfigPath, "utf8"), /niucodes_image_gen/);
 
   await mkdir(path.dirname(installedRequest), { recursive: true });

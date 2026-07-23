@@ -56,7 +56,7 @@ jobs:
           path: release/niucodes-image-gen-${{ matrix.id }}-v*.zip
           if-no-files-found: error
 
-  publish:
+  assemble-release:
     needs: packaged-e2e
     runs-on: ubuntu-latest
     steps:
@@ -75,6 +75,50 @@ jobs:
       - run: npm ci
       - run: npm run assemble:release -- --input-dir verified-packages
 
+      - name: Upload assembled release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: niucodes-image-gen-release-assets
+          path: |
+            release/niucodes-image-gen-v*.zip
+            release/niucodes-image-gen-macos-arm64-v*.zip
+            release/niucodes-image-gen-macos-x64-v*.zip
+            release/niucodes-image-gen-win-x64-v*.zip
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+
+  universal-windows-e2e:
+    needs: assemble-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: niucodes-image-gen-release-assets
+          path: release-assets
+      - name: Unpack and test the final universal ZIP directly
+        shell: pwsh
+        run: |
+          $version = (node -p "require('./package.json').version")
+          $archive = "release-assets/niucodes-image-gen-v$version.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "niucodes-image-gen final universal E2E"
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+          node scripts/tests/packaged-e2e.mjs --package-root (Join-Path $destination "niucodes-image-gen")
+
+  publish:
+    needs: universal-windows-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: niucodes-image-gen-release-assets
+          path: release
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -88,3 +132,17 @@ jobs:
             "release/niucodes-image-gen-win-x64-v${version}.zip" \
             release/SHA256SUMS.txt \
             --clobber
+
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-release
+          gh release download "${{ inputs.tag }}" \
+            --dir downloaded-release \
+            --pattern "niucodes-image-gen-v*.zip" \
+            --pattern "niucodes-image-gen-macos-arm64-v*.zip" \
+            --pattern "niucodes-image-gen-macos-x64-v*.zip" \
+            --pattern "niucodes-image-gen-win-x64-v*.zip"
+          cp release/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
+          (cd downloaded-release && sha256sum -c SHA256SUMS.txt)

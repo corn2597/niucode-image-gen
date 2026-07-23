@@ -1,6 +1,8 @@
+import { createWriteStream } from "node:fs";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import archiver from "archiver";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -21,7 +23,16 @@ const platforms = ["macos-arm64", "macos-x64", "win-x64"];
 const archiveNames = platforms.map((platform) => `${packageName}-${platform}-v${version}.zip`);
 
 async function zipDirectory(directoryName, archiveName) {
-  await execFileAsync("zip", ["-q", "-r", archiveName, directoryName], { cwd: releaseDir });
+  await new Promise((resolve, reject) => {
+    const output = createWriteStream(path.join(releaseDir, archiveName));
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    output.once("close", resolve);
+    output.once("error", reject);
+    archive.once("error", reject);
+    archive.pipe(output);
+    archive.directory(path.join(releaseDir, directoryName), directoryName);
+    archive.finalize();
+  });
 }
 
 async function checksum(fileName) {

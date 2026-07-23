@@ -1,10 +1,9 @@
+import { createWriteStream } from "node:fs";
 import { cp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import archiver from "archiver";
 import path from "node:path";
 
-const execFileAsync = promisify(execFile);
 const root = path.resolve(".");
 const releaseDir = path.join(root, "release");
 const packageName = "niucodes-image-gen";
@@ -72,7 +71,16 @@ async function makePackage(destinationRoot, selectedPlatforms) {
 }
 
 async function zipDirectory(directoryName, archiveName) {
-  await execFileAsync("zip", ["-q", "-r", archiveName, directoryName], { cwd: releaseDir });
+  await new Promise((resolve, reject) => {
+    const output = createWriteStream(path.join(releaseDir, archiveName));
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    output.once("close", resolve);
+    output.once("error", reject);
+    archive.once("error", reject);
+    archive.pipe(output);
+    archive.directory(path.join(releaseDir, directoryName), directoryName);
+    archive.finalize();
+  });
 }
 
 async function sha256(fileName) {

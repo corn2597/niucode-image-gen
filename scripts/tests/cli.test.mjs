@@ -107,9 +107,12 @@ test("installer copies the native executable, preserves API config, and removes 
   await writeFile(path.join(sourceRoot, "bin", "niucodes-image-gen-macos-arm64"), "binary");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), '{"apiKey":"preserved-key"}');
+  await mkdir(path.join(installDir, "bin"), { recursive: true });
+  await writeFile(path.join(installDir, "bin", "obsolete-installer.exe"), "obsolete binary");
   await mkdir(path.join(installDir, "scripts"), { recursive: true });
   await writeFile(path.join(installDir, "scripts", "invoke-imagegen.ps1"), "legacy runner");
   await writeFile(path.join(installDir, "scripts", "invoke-imagegen.sh"), "legacy runner");
+  await writeFile(path.join(installDir, "scripts", "unrecognized-legacy-runner.ps1"), "legacy runner");
   await mkdir(path.dirname(configPath), { recursive: true });
   await writeFile(configPath, '[mcp_servers.other]\ncommand = "other"\n\n[mcp_servers.niucodes_image_gen]\ncommand = "old"\nargs = ["mcp"]\n');
 
@@ -119,8 +122,10 @@ test("installer copies the native executable, preserves API config, and removes 
   assert.equal(result.protocol, "request-file-v1");
   assert.equal(result.removed_legacy_mcp_config, true);
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved-key"}');
+  assert.equal(await exists(path.join(installDir, "bin", "obsolete-installer.exe")), false);
   assert.equal(await exists(path.join(installDir, "scripts", "invoke-imagegen.ps1")), false);
   assert.equal(await exists(path.join(installDir, "scripts", "invoke-imagegen.sh")), false);
+  assert.equal(await exists(path.join(installDir, "scripts")), false);
   const codexConfig = await readFile(configPath, "utf8");
   assert.match(codexConfig, /\[mcp_servers\.other\]/);
   assert.doesNotMatch(codexConfig, /\[mcp_servers\.niucodes_image_gen\]/);
@@ -275,6 +280,23 @@ test("request-file failures return JSON without exposing credentials", async () 
   assert.match(result.error.message, /cannot contain apiKey/);
   assert.doesNotMatch(`${failure.stdout}${failure.stderr}`, /must-not-leak/);
   assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+});
+
+test("request-file protocol rejects old prompt flags as structured JSON", async () => {
+  let failure;
+  try {
+    await execFileAsync(process.execPath, [scriptPath, "run", "--prompt", "old runner invocation"]);
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure);
+  assert.equal(failure.code, 1);
+  assert.equal(failure.stderr, "Usage: niucodes-image-gen run --request-file <absolute-request.json>\n");
+  const result = JSON.parse(failure.stdout);
+  assert.equal(result.status, "failed");
+  assert.equal(result.command, "run");
+  assert.equal(result.exit_code, 1);
+  assert.match(result.error.message, /request-file/);
 });
 
 test("request-file accepts a Windows UTF-8 BOM and keeps user data out of argv", async () => {
