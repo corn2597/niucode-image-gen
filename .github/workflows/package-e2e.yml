@@ -25,7 +25,7 @@ jobs:
             package_dir: niucodes-image-gen-macos-arm64
             build_script: build:package:macos-arm64
           - id: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
             archive_id: macos-x64
             package_dir: niucodes-image-gen-macos-x64
             build_script: build:package:macos-x64
