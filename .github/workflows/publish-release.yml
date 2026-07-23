@@ -117,6 +117,8 @@ jobs:
     needs: universal-windows-e2e
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: niucodes-image-gen-release-assets
