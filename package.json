@@ -1,6 +1,6 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "private": true,
   "description": "Standalone OpenAI Images SDK wrapper for generation and editing.",
   "type": "module",
@@ -22,7 +22,8 @@
     "assemble:release": "node scripts/assemble-release.mjs"
   },
   "dependencies": {
-    "openai": "^6.44.0"
+    "openai": "^6.44.0",
+    "undici": "^6.27.0"
   },
   "devDependencies": {
     "@yao-pkg/pkg": "^5.16.1",

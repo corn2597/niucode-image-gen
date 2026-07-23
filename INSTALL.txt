@@ -1,6 +1,7 @@
 NiuCodes Image Gen installation
 
 1. Edit config.json and enter your API key.
+   If the computer must use a company proxy, set optional proxyUrl to its http:// or https:// URL in the same file.
 2. Run the installer for your platform:
    - Apple Silicon Mac: scripts/install-macos-arm64.command
    - Intel Mac: scripts/install-macos-x64.command

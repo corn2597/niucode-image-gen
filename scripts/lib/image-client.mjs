@@ -82,6 +82,20 @@ function parseString(value, fallback) {
   return String(value).trim();
 }
 
+function parseProxyUrl(value) {
+  const proxyUrl = parseString(value, undefined);
+  if (!proxyUrl) return undefined;
+  try {
+    const parsed = new URL(proxyUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('unsupported protocol');
+    }
+    return parsed.toString();
+  } catch {
+    throw new Error('proxyUrl must be a valid http or https URL.');
+  }
+}
+
 function parsePrompt(value) {
   if (value === undefined || value === null) return undefined;
   const prompt = String(value);
@@ -198,6 +212,9 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     cwd,
     apiKey: parseString(config.apiKey, undefined),
     baseURL: trimTrailingSlash(parseString(merged.baseURL, DEFAULT_BASE_URL)),
+    // Proxy credentials, if any, remain in config.json and are never accepted
+    // from the request file or emitted in a result.
+    proxyUrl: parseProxyUrl(config.proxyUrl),
     model: parseString(merged.model, "gpt-image-2"),
     prompt: parsePrompt(merged.prompt),
     output: parseString(merged.output, undefined),
@@ -236,41 +253,98 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   return invocation;
 }
 
-export async function createImageRequest(invocation) {
-  const client = new OpenAI({
-    apiKey: invocation.apiKey,
-    baseURL: invocation.baseURL,
-    // This wrapper favors returning a failure promptly over hidden retry delays.
-    maxRetries: 0,
-    timeout: invocation.timeoutMs,
-  });
-  const payload = applySharedPayload(invocation);
-  if (invocation.command === "generate") {
-    const apiStartedAt = performance.now();
-    return {
-      response: await client.images.generate(payload),
-      inputPrepareMs: 0,
-      apiDurationMs: Math.round(performance.now() - apiStartedAt),
-    };
+async function createClient(invocation, clientRequestId) {
+  let dispatcher;
+  let fetch;
+  if (invocation.proxyUrl) {
+    // Import only for configured proxy users. Loading undici's global
+    // dispatcher on ordinary direct requests can keep native runners alive.
+    const { fetch: undiciFetch, ProxyAgent } = await import("undici");
+    dispatcher = new ProxyAgent(invocation.proxyUrl);
+    fetch = (url, init) => undiciFetch(url, { ...init, dispatcher });
   }
 
-  const preparationStartedAt = performance.now();
-  const images = await Promise.all(invocation.images.map((filePath) => toUploadable(path.resolve(invocation.cwd, filePath))));
-  const editPayload = { ...payload, image: images.length === 1 ? images[0] : images };
-  if (invocation.mask) editPayload.mask = await toUploadable(path.resolve(invocation.cwd, invocation.mask));
-  if (invocation.inputFidelity) editPayload.input_fidelity = invocation.inputFidelity;
-  const inputPrepareMs = Math.round(performance.now() - preparationStartedAt);
-  const apiStartedAt = performance.now();
   return {
-    response: await client.images.edit(editPayload),
-    inputPrepareMs,
-    apiDurationMs: Math.round(performance.now() - apiStartedAt),
+    client: new OpenAI({
+      apiKey: invocation.apiKey,
+      baseURL: invocation.baseURL,
+      // This wrapper favors returning a failure promptly over hidden retry delays.
+      maxRetries: 0,
+      timeout: invocation.timeoutMs,
+      defaultHeaders: { "X-Niucodes-Client-Request-Id": clientRequestId },
+      ...(fetch ? { fetch } : {}),
+    }),
+    async close() {
+      if (dispatcher) await dispatcher.close();
+    },
+  };
+}
+
+export async function createImageRequest(invocation, { clientRequestId } = {}) {
+  const { client, close } = await createClient(invocation, clientRequestId);
+  try {
+    const payload = applySharedPayload(invocation);
+    if (invocation.command === "generate") {
+      const apiStartedAt = performance.now();
+      return {
+        response: await client.images.generate(payload),
+        inputPrepareMs: 0,
+        apiDurationMs: Math.round(performance.now() - apiStartedAt),
+      };
+    }
+
+    const preparationStartedAt = performance.now();
+    const images = await Promise.all(invocation.images.map((filePath) => toUploadable(path.resolve(invocation.cwd, filePath))));
+    const editPayload = { ...payload, image: images.length === 1 ? images[0] : images };
+    if (invocation.mask) editPayload.mask = await toUploadable(path.resolve(invocation.cwd, invocation.mask));
+    if (invocation.inputFidelity) editPayload.input_fidelity = invocation.inputFidelity;
+    const inputPrepareMs = Math.round(performance.now() - preparationStartedAt);
+    const apiStartedAt = performance.now();
+    return {
+      response: await client.images.edit(editPayload),
+      inputPrepareMs,
+      apiDurationMs: Math.round(performance.now() - apiStartedAt),
+    };
+  } finally {
+    await close();
+  }
+}
+
+function transportCause(error) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && typeof current === "object" && depth < 5; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = typeof current.code === "string" && /^[A-Z0-9_]+$/.test(current.code)
+      ? current.code
+      : undefined;
+    const name = typeof current.name === "string" && /^[A-Za-z0-9_]+$/.test(current.name)
+      ? current.name
+      : undefined;
+    if (code || (depth > 0 && name)) return { ...(name ? { name } : {}), ...(code ? { code } : {}) };
+    current = current.cause;
+  }
+  return undefined;
+}
+
+export function isRequestDeliveryUnknown(error) {
+  return error?.name === "APIConnectionError" || error?.constructor?.name === "APIConnectionError";
+}
+
+export function describeOpenAIError(error) {
+  const transport = transportCause(error);
+  return {
+    message: formatOpenAIError(error),
+    ...(isRequestDeliveryUnknown(error) ? { kind: "request_delivery_unknown" } : {}),
+    ...(transport ? { transport } : {}),
   };
 }
 
 export function formatOpenAIError(error) {
   if (!error || typeof error !== "object") return String(error);
-  return [error.message, error.code && `code=${error.code}`, error.status && `status=${error.status}`, error.request_id && `request_id=${error.request_id}`]
+  const transport = transportCause(error);
+  return [error.message, error.code && `code=${error.code}`, error.status && `status=${error.status}`, error.request_id && `request_id=${error.request_id}`, transport?.code && `transport=${transport.code}`]
     .filter(Boolean)
     .join(" | ") || JSON.stringify(error);
 }

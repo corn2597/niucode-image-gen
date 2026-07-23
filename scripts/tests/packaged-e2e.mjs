@@ -147,6 +147,7 @@ let requestCount = 0;
 await withMockImagesApi(async (request, response, body) => {
   requestCount += 1;
   assert.equal(request.headers.authorization, "Bearer packaged-e2e-key");
+  assert.match(request.headers["x-niucodes-client-request-id"], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
   if (request.url === "/v1/images/generations") {
     const payload = JSON.parse(body);
     assert.ok([

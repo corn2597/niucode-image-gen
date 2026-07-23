@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import process from "node:process";
 
@@ -7,7 +8,9 @@ import {
   DEFAULT_EDIT_SIZE,
   DEFAULT_GENERATE_SIZE,
   createImageRequest,
+  describeOpenAIError,
   formatOpenAIError,
+  isRequestDeliveryUnknown,
   resolveInvocation,
 } from "./image-client.mjs";
 import {
@@ -176,6 +179,7 @@ function buildResponse(invocation, targets, savedItems, apiResponse, verboseResp
     timing_ms: timing,
     error: null,
     request_id: apiResponse?._request_id ?? null,
+    client_request_id: invocation.clientRequestId,
     model: invocation.model,
     base_url: invocation.baseURL ?? DEFAULT_BASE_URL,
     size: invocation.size,
@@ -281,7 +285,7 @@ function parseRequestFile(contents, requestPath) {
   }
 }
 
-function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, exitCode = null, stage }) {
+function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, clientRequestId = null, exitCode = null, stage }) {
   return {
     version: 1,
     command,
@@ -293,6 +297,7 @@ function lifecyclePayload({ command, status, startedAt, timing, saved = [], erro
     timing_ms: timing,
     error,
     request_id: requestId,
+    client_request_id: clientRequestId,
     ...(stage ? { stage } : {}),
     ...(error ? { error } : {}),
   };
@@ -410,11 +415,13 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
 
   const statusFile = resolveStatusFile(options.statusFile, cwd);
   let invocation;
+  const clientRequestId = randomUUID();
 
   try {
     const verboseResponse = resolveVerboseResponse(options.verboseResponse);
     const resolveStartedAt = performance.now();
     invocation = await resolveInvocation(command, options, { cwd });
+    invocation.clientRequestId = clientRequestId;
     const resolveDurationMs = Math.round(performance.now() - resolveStartedAt);
     await writeStatusFile(statusFile, lifecyclePayload({
       command: invocation.command,
@@ -423,8 +430,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       timing: { total: Math.round(performance.now() - cliStartedAt) },
       exitCode: null,
       stage: "request",
+      clientRequestId,
     }));
-    const { response: apiResponse, inputPrepareMs, apiDurationMs } = await createImageRequest(invocation);
+    const { response: apiResponse, inputPrepareMs, apiDurationMs } = await createImageRequest(invocation, { clientRequestId });
     const outputStartedAt = performance.now();
     const outputTargets = await resolveOutputTargets({
       command: invocation.command,
@@ -467,8 +475,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         status: "failed",
         startedAt,
         timing: { total: Math.round(performance.now() - cliStartedAt) },
-        stage: invocation ? "request_or_save" : "initialization",
-        error: { message: formatOpenAIError(error) },
+        stage: invocation && isRequestDeliveryUnknown(error) ? "request_delivery_unknown" : invocation ? "request_or_save" : "initialization",
+        error: describeOpenAIError(error),
+        clientRequestId: invocation ? clientRequestId : null,
         exitCode: 1,
       }));
     } catch (statusError) {

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -61,6 +62,42 @@ async function withMockServer(handler, run) {
     await run(`http://127.0.0.1:${port}/v1`);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+}
+
+async function withHttpProxy(run) {
+  const proxy = createServer((request, response) => {
+    const target = new URL(request.url);
+    const upstream = httpRequest({
+      hostname: target.hostname,
+      port: target.port || 80,
+      path: `${target.pathname}${target.search}`,
+      method: request.method,
+      headers: request.headers,
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.once("error", () => response.destroy());
+    request.pipe(upstream);
+  });
+  proxy.on("connect", (request, clientSocket, head) => {
+    const [hostname, port = "443"] = request.url.split(":");
+    const upstream = createConnection({ host: hostname, port: Number(port) });
+    upstream.once("connect", () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head.length > 0) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstream.once("error", () => clientSocket.destroy());
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const { port } = proxy.address();
+  try {
+    await run(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise((resolve, reject) => proxy.close((error) => error ? reject(error) : resolve()));
   }
 }
 
@@ -225,8 +262,11 @@ test("request-file executes generate and edit without image command-line argumen
   await mkdir(skillRoot, { recursive: true });
   await writePng(sourcePath);
 
+  const clientRequestIds = [];
   await withMockServer(async (req, res, body) => {
     assert.equal(req.headers.authorization, "Bearer request-file-key");
+    assert.match(req.headers["x-niucodes-client-request-id"], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    clientRequestIds.push(req.headers["x-niucodes-client-request-id"]);
     if (req.url === "/v1/images/generations") {
       const payload = JSON.parse(body);
       assert.equal(payload.prompt, '中文 prompt with spaces and "quotes"');
@@ -255,6 +295,7 @@ test("request-file executes generate and edit without image command-line argumen
     const generateResult = JSON.parse(generated.stdout);
     assert.equal(generated.stderr, "");
     assert.equal(generateResult.status, "success");
+    assert.equal(generateResult.client_request_id, clientRequestIds[0]);
     assert.deepEqual(JSON.parse(await readFile(generateStatus, "utf8")), generateResult);
     assert.equal((await readFile(generateOutput)).toString("base64"), fixturePngBase64);
 
@@ -275,8 +316,58 @@ test("request-file executes generate and edit without image command-line argumen
     const editResult = JSON.parse(edited.stdout);
     assert.equal(edited.stderr, "");
     assert.equal(editResult.status, "success");
+    assert.equal(editResult.client_request_id, clientRequestIds[1]);
     assert.deepEqual(JSON.parse(await readFile(editStatus, "utf8")), editResult);
     assert.equal((await readFile(editOutput)).toString("base64"), fixturePngBase64);
+  });
+});
+
+test("connection loss after the API receives a request is reported as delivery unknown without retrying", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const requestPath = path.join(tempDir, "request.json");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  await mkdir(skillRoot, { recursive: true });
+  let receivedRequestCount = 0;
+  let receivedClientRequestId;
+
+  await withMockServer(async (req, res) => {
+    receivedRequestCount += 1;
+    receivedClientRequestId = req.headers["x-niucodes-client-request-id"];
+    // The service has received the request but the response connection dies.
+    // A retry here could create and bill for a duplicate image.
+    res.destroy();
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "connection-test-key", baseURL }));
+    await writeFile(requestPath, JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: "connection should be reported safely",
+      output: outputPath,
+      overwrite: true,
+    }));
+    let failure;
+    try {
+      await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", requestPath], {
+        env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    assert.equal(failure.code, 1);
+    const result = JSON.parse(failure.stdout);
+    assert.equal(result.status, "failed");
+    assert.equal(result.exit_code, 1);
+    assert.equal(result.stage, "request_delivery_unknown");
+    assert.equal(result.error.kind, "request_delivery_unknown");
+    assert.equal(result.client_request_id, receivedClientRequestId);
+    assert.match(result.error.message, /Connection error/i);
+    assert.equal(receivedRequestCount, 1);
+    assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+    assert.equal(await exists(outputPath), false);
   });
 });
 
@@ -461,6 +552,63 @@ test("config defaults are retained and API key flags are rejected", async () => 
     execFileAsync(process.execPath, [scriptPath, "generate", "--config", configPath, "--api-key", "ignored", "--prompt", "a test"]),
     /--api-key is not supported/,
   );
+});
+
+test("proxyUrl is read only from config.json and validated before a request", async () => {
+  const tempDir = await createTempDir();
+  const configPath = path.join(tempDir, "config.json");
+  await writeFile(configPath, JSON.stringify({ apiKey: "config-key", proxyUrl: "http://proxy.example.test:8080" }));
+  const invocation = await resolveInvocation("generate", {
+    config: configPath,
+    prompt: "a test",
+    output: path.join(tempDir, "generated.png"),
+    image: [],
+  }, { cwd: repoRoot });
+  assert.equal(invocation.proxyUrl, "http://proxy.example.test:8080/");
+
+  await writeFile(configPath, JSON.stringify({ apiKey: "config-key", proxyUrl: "socks5://proxy.example.test" }));
+  await assert.rejects(
+    resolveInvocation("generate", {
+      config: configPath,
+      prompt: "a test",
+      output: path.join(tempDir, "generated.png"),
+      image: [],
+    }, { cwd: repoRoot }),
+    /proxyUrl must be a valid http or https URL/,
+  );
+});
+
+test("configured HTTP proxy carries a generate request and closes its dispatcher", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const requestPath = path.join(tempDir, "request.json");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  await mkdir(skillRoot, { recursive: true });
+
+  await withMockServer(async (request, response) => {
+    assert.equal(request.url, "/v1/images/generations");
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    await withHttpProxy(async (proxyUrl) => {
+      await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "proxy-test-key", baseURL, proxyUrl }));
+      await writeFile(requestPath, JSON.stringify({
+        version: 1,
+        command: "generate",
+        statusFile: statusPath,
+        prompt: "proxy request",
+        output: outputPath,
+        overwrite: true,
+      }));
+      const { stdout, stderr } = await execFileAsync(process.execPath, [scriptPath, "run", "--request-file", requestPath], {
+        env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+      });
+      assert.equal(stderr, "");
+      assert.equal(JSON.parse(stdout).status, "success");
+      assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+    });
+  });
 });
 
 test("requires an explicit output location outside the skill directory", async () => {

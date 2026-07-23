@@ -23,4 +23,6 @@ Treat `config.json.timeoutMs` as an API deadline, never an early-cancel target. 
 
 Use the final JSON result from stdout or, only when needed, that one `statusFile` read. On success, answer with its `exit_code`, `timing_ms`, and each `saved[*].markdown` image link. On failure, answer with its `exit_code`, `timing_ms`, and `error.message`. Do not make any other follow-up tool call after the runner returns.
 
-`config.json` at the package root is the only API credential source. Never request, inspect, print, store, or pass its API key through chat, environment variables, flags, or documentation.
+Every request has a `client_request_id`. If `stage` or `error.kind` is `request_delivery_unknown`, the request may have reached the image service even though the native client did not receive a complete response. Do not retry it, do not claim that the image API rejected it, and include `client_request_id` in the final answer so the service operator can locate the original request without a duplicate image call.
+
+`config.json` at the package root is the only API credential source. Never request, inspect, print, store, or pass its API key through chat, environment variables, flags, or documentation. For a corporate network that requires an outbound proxy, the user may set `proxyUrl` in that same file to an `http://` or `https://` proxy URL; never copy or print it.
