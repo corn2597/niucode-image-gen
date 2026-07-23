@@ -78,6 +78,11 @@ test("skill uses its bundled native request-file entrypoint and does not prescri
   assert.match(skill, /bundled native executable/i);
   assert.match(skill, /run --request-file/i);
   assert.match(skill, /do not interrupt the native executable/i);
+  assert.match(skill, /terminal reports that the command is still running, wait on that same terminal session/i);
+  assert.match(skill, /do not read `statusFile` while that session is running/i);
+  assert.match(skill, /stdout is empty or not valid JSON, read the request's `statusFile` exactly once/i);
+  assert.match(skill, /not a status poll, retry, preflight, image read, or API request/i);
+  assert.match(skill, /absent, invalid, or still `running`.*do not run the executable again/i);
   assert.doesNotMatch(skill, /invoke-imagegen\.sh|invoke-imagegen\.ps1/);
   assert.doesNotMatch(skill, /imagegen_generate|imagegen_edit|native MCP/i);
   assert.doesNotMatch(await readFile(scriptPath, "utf8"), /runMcpServer|mcp-server/);
