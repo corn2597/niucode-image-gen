@@ -39,7 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $version = (node -p "require('./package.json').version")
-          $archive = "release/niucodes-image-gen-${{ matrix.id }}-v$version.zip"
+          $archive = "release/niucodes-image-gen-${{ matrix.package_dir }}-v$version.zip"
           $destination = Join-Path $env:RUNNER_TEMP "niucodes-image-gen packaged E2E"
           Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
           node scripts/tests/packaged-e2e.mjs --package-root (Join-Path $destination "${{ matrix.package_dir }}")
