@@ -41,6 +41,25 @@ async function runNative(executable, requestFile) {
   });
 }
 
+async function runNativeViaPowerShell(executable, requestFile) {
+  if (process.platform !== "win32") return runNative(executable, requestFile);
+
+  // Encode paths instead of interpolating them into PowerShell source. This
+  // verifies the user-facing `& exe run --request-file <path>` boundary with
+  // Chinese and space-containing paths while keeping request content off argv.
+  const script = [
+    `$exe = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(executable, "utf8").toString("base64")}'))`,
+    `$request = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(requestFile, "utf8").toString("base64")}'))`,
+    "& $exe run --request-file $request",
+    "exit $LASTEXITCODE",
+  ].join("\n");
+  const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
+  return execFileAsync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
 async function findPowerShellScripts(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   const matches = [];
@@ -81,8 +100,8 @@ async function withMockImagesApi(handler, run) {
   }
 }
 
-async function assertSuccessfulRequest(executable, requestFile, statusFile, outputFile) {
-  const { stdout, stderr } = await runNative(executable, requestFile);
+async function assertSuccessfulRequest(executable, requestFile, statusFile, outputFile, runner = runNative) {
+  const { stdout, stderr } = await runner(executable, requestFile);
   assert.equal(stderr, "");
   const result = JSON.parse(stdout);
   assert.equal(result.status, "success");
@@ -168,6 +187,11 @@ await withMockImagesApi(async (request, response, body) => {
   }));
   await assertSuccessfulRequest(executable, editRequest, editStatus, editedImage);
 
+  if (process.platform === "win32") {
+    await assertSuccessfulRequest(executable, generateRequest, generateStatus, generatedImage, runNativeViaPowerShell);
+    await assertSuccessfulRequest(executable, editRequest, editStatus, editedImage, runNativeViaPowerShell);
+  }
+
   const installResult = JSON.parse((await runNativeInstall(executable, installedSkill, installedConfigPath)).stdout);
   assert.equal(installResult.status, "success");
   assert.equal(installResult.protocol, "request-file-v1");
@@ -192,5 +216,5 @@ await withMockImagesApi(async (request, response, body) => {
   await assertSuccessfulRequest(path.join(installedSkill, "bin", binaryName()), installedRequest, installedStatus, installedOutput);
 });
 
-assert.equal(requestCount, 3);
+assert.equal(requestCount, process.platform === "win32" ? 5 : 3);
 process.stdout.write(`${JSON.stringify({ status: "success", platform: `${process.platform}-${process.arch}`, package_root: packageRoot, generate: generatedImage, edit: editedImage })}\n`);
