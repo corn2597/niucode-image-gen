@@ -130,6 +130,12 @@ jobs:
         run: |
           version="${{ inputs.tag }}"
           version="${version#v}"
+          if ! gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
+            gh release create "${{ inputs.tag }}" \
+              --target "${GITHUB_SHA}" \
+              --title "${{ inputs.tag }}" \
+              --generate-notes
+          fi
           gh release upload "${{ inputs.tag }}" \
             "release/niucodes-image-gen-v${version}.zip" \
             "release/niucodes-image-gen-macos-arm64-v${version}.zip" \
