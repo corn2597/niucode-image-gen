@@ -112,7 +112,7 @@ export async function installSkill({
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
     executable,
-    protocol: "request-file-v1",
+    protocol: "stream-stdin-v2",
     removed_legacy_mcp_config: removedLegacyMcpConfig,
     restart_required: true,
   };

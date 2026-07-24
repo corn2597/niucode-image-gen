@@ -202,6 +202,90 @@ function applySharedPayload(invocation) {
   return payload;
 }
 
+function createRequestLifecycle(timeoutMs) {
+  const controller = new AbortController();
+  let abortMessage = null;
+  let abortListener = null;
+
+  const abort = (message) => {
+    if (abortMessage) return;
+    abortMessage = message;
+    controller.abort();
+    abortListener?.();
+  };
+  const onSignal = (signalName) => abort(`Image request cancelled by ${signalName}.`);
+  const onSigint = () => onSignal("SIGINT");
+  const onSigterm = () => onSignal("SIGTERM");
+  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`), timeoutMs);
+
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+
+  return {
+    signal: controller.signal,
+    addAbortListener(listener) {
+      abortListener = listener;
+      if (abortMessage) listener();
+    },
+    throwIfAborted() {
+      if (abortMessage) throw new Error(abortMessage);
+    },
+    dispose() {
+      clearTimeout(timeout);
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+      abortListener = null;
+    },
+  };
+}
+
+function completedEventType(command) {
+  return command === "generate" ? "image_generation.completed" : "image_edit.completed";
+}
+
+function partialEventType(command) {
+  return command === "generate" ? "image_generation.partial_image" : "image_edit.partial_image";
+}
+
+async function consumeImageStream(stream, invocation, lifecycle) {
+  const completed = [];
+  let firstEventMs = null;
+  let partialEventCount = 0;
+  const expectedCompletedType = completedEventType(invocation.command);
+  const expectedPartialType = partialEventType(invocation.command);
+
+  lifecycle.addAbortListener(() => stream.controller.abort());
+  try {
+    for await (const event of stream) {
+      lifecycle.throwIfAborted();
+      if (firstEventMs === null) firstEventMs = Math.round(performance.now());
+
+      if (event?.type === expectedPartialType) {
+        partialEventCount += 1;
+        continue;
+      }
+      if (event?.type === expectedCompletedType) {
+        if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
+          throw new Error("Image stream completed without image data.");
+        }
+        completed.push({
+          b64_json: event.b64_json,
+          revised_prompt: event.revised_prompt ?? null,
+        });
+        continue;
+      }
+      throw new Error(`Image stream returned an unsupported event: ${String(event?.type ?? "unknown")}.`);
+    }
+  } finally {
+    lifecycle.throwIfAborted();
+  }
+
+  if (completed.length === 0) {
+    throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
+  }
+  return { completed, firstEventMs, partialEventCount };
+}
+
 export async function resolveInvocation(command, cliOptions, { cwd = process.cwd() } = {}) {
   const config = await readConfigFile(cliOptions.config, cwd);
   const merged = mergeDefinedObjects(config, cliOptions);
@@ -282,14 +366,26 @@ async function createClient(invocation, clientRequestId) {
 
 export async function createImageRequest(invocation, { clientRequestId } = {}) {
   const { client, close } = await createClient(invocation, clientRequestId);
+  const lifecycle = createRequestLifecycle(invocation.timeoutMs);
   try {
-    const payload = applySharedPayload(invocation);
+    const payload = {
+      ...applySharedPayload(invocation),
+      // The API emits exactly one final image event. Extra partial previews add
+      // image output tokens and do not make the final result available sooner.
+      stream: true,
+      partial_images: 0,
+    };
     if (invocation.command === "generate") {
       const apiStartedAt = performance.now();
+      const request = client.images.generate(payload, { signal: lifecycle.signal });
+      const { data: stream, request_id: requestId } = await request.withResponse();
+      const consumed = await consumeImageStream(stream, invocation, lifecycle);
       return {
-        response: await client.images.generate(payload),
+        response: { data: consumed.completed, _request_id: requestId },
         inputPrepareMs: 0,
         apiDurationMs: Math.round(performance.now() - apiStartedAt),
+        streamFirstEventMs: consumed.firstEventMs === null ? null : Math.max(0, consumed.firstEventMs - Math.round(apiStartedAt)),
+        streamPartialEventCount: consumed.partialEventCount,
       };
     }
 
@@ -299,13 +395,25 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
     if (invocation.mask) editPayload.mask = await toUploadable(path.resolve(invocation.cwd, invocation.mask));
     if (invocation.inputFidelity) editPayload.input_fidelity = invocation.inputFidelity;
     const inputPrepareMs = Math.round(performance.now() - preparationStartedAt);
+    lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
+    const request = client.images.edit(editPayload, { signal: lifecycle.signal });
+    const { data: stream, request_id: requestId } = await request.withResponse();
+    const consumed = await consumeImageStream(stream, invocation, lifecycle);
     return {
-      response: await client.images.edit(editPayload),
+      response: { data: consumed.completed, _request_id: requestId },
       inputPrepareMs,
       apiDurationMs: Math.round(performance.now() - apiStartedAt),
+      streamFirstEventMs: consumed.firstEventMs === null ? null : Math.max(0, consumed.firstEventMs - Math.round(apiStartedAt)),
+      streamPartialEventCount: consumed.partialEventCount,
     };
+  } catch (error) {
+    // The SDK wraps an aborted fetch as APIConnectionError. Preserve the
+    // deterministic local cancellation reason instead of marking it delivery-unknown.
+    lifecycle.throwIfAborted();
+    throw error;
   } finally {
+    lifecycle.dispose();
     await close();
   }
 }

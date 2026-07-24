@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -24,6 +24,32 @@ const repoRoot = path.resolve(".");
 const scriptPath = path.join(repoRoot, "scripts", "niucodes-image-gen.mjs");
 const fixturePngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s4Xv2QAAAAASUVORK5CYII=";
 const tempDirectories = [];
+
+async function runWithStdin(file, args, input, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, {
+      ...options,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      const result = {
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      };
+      if (code === 0) resolve(result);
+      else reject(Object.assign(new Error(`Command exited with ${code ?? signal}`), result));
+    });
+    child.stdin.end(input, "utf8");
+  });
+}
 
 afterEach(async () => {
   const { rm } = await import("node:fs/promises");
@@ -63,6 +89,19 @@ async function withMockServer(handler, run) {
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+}
+
+function streamCompleted(response, command, { partialImages = 0 } = {}) {
+  const prefix = command === "generate" ? "image_generation" : "image_edit";
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "x-request-id": `mock-${prefix}-request`,
+    "cache-control": "no-cache",
+  });
+  for (let index = 0; index < partialImages; index += 1) {
+    response.write(`data: ${JSON.stringify({ type: `${prefix}.partial_image`, b64_json: fixturePngBase64, partial_image_index: index })}\n\n`);
+  }
+  response.end(`data: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 })}\n\ndata: [DONE]\n\n`);
 }
 
 async function withHttpProxy(run) {
@@ -110,16 +149,17 @@ test("skill uses a root config file and has no stored key or key setter flow", a
   assert.doesNotMatch(skill, /set-skill-api-key|OPENAI_API_KEY|API_KEY:/i);
 });
 
-test("skill uses its bundled native request-file entrypoint and does not prescribe MCP", async () => {
+test("skill uses its bundled native streaming stdin entrypoint and does not prescribe MCP", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
   assert.match(skill, /bundled native executable/i);
-  assert.match(skill, /run --request-file/i);
-  assert.match(skill, /do not interrupt the native executable/i);
-  assert.match(skill, /terminal reports that the command is still running, wait on that same terminal session/i);
-  assert.match(skill, /do not read `statusFile` while that session is running/i);
-  assert.match(skill, /stdout is empty or not valid JSON, read the request's `statusFile` exactly once/i);
-  assert.match(skill, /not a status poll, retry, preflight, image read, or API request/i);
-  assert.match(skill, /absent, invalid, or still `running`.*do not run the executable again/i);
+  assert.match(skill, /run --request-stdin/i);
+  assert.match(skill, /HTTP SSE image stream/i);
+  assert.match(skill, /partial_images: 0/i);
+  assert.match(skill, /Never first create a request file, a temporary shell script, or a PowerShell script/i);
+  assert.match(skill, /quoted here-document/i);
+  assert.match(skill, /\$request \| & \(Join-Path \$env:USERPROFILE/i);
+  assert.match(skill, /stdout is empty or invalid JSON, read that request's `statusFile` exactly once/i);
+  assert.match(skill, /never falls back to non-streaming and never retries/i);
   assert.doesNotMatch(skill, /invoke-imagegen\.sh|invoke-imagegen\.ps1/);
   assert.doesNotMatch(skill, /imagegen_generate|imagegen_edit|native MCP/i);
   assert.doesNotMatch(await readFile(scriptPath, "utf8"), /runMcpServer|mcp-server/);
@@ -181,7 +221,7 @@ test("installer copies the native executable, preserves API config, and removes 
   const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
   assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
-  assert.equal(result.protocol, "request-file-v1");
+  assert.equal(result.protocol, "stream-stdin-v2");
   assert.equal(result.removed_legacy_mcp_config, true);
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved-key"}');
   assert.equal(await exists(path.join(installDir, "bin", "obsolete-installer.exe")), false);
@@ -210,7 +250,7 @@ test("Apple Silicon installation resolves the native entrypoint and removes lega
   const result = await installSkill({ packageRoot: sourceRoot, installDir, configPath, platform: "darwin", arch: "arm64" });
   assert.equal(result.status, "success");
   assert.equal(result.executable, path.join(installDir, "bin", "niucodes-image-gen-macos-arm64"));
-  assert.equal(result.protocol, "request-file-v1");
+  assert.equal(result.protocol, "stream-stdin-v2");
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved"}');
   assert.doesNotMatch(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
 });
@@ -225,8 +265,9 @@ test("generate forwards prompt verbatim and reads the key only from config.json"
     const payload = JSON.parse(body);
     assert.equal(payload.prompt, "  Use EXACT wording: teal cube / 1990s film.  ");
     assert.equal(payload.size, DEFAULT_GENERATE_SIZE);
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    assert.equal(payload.stream, true);
+    assert.equal(payload.partial_images, 0);
+    streamCompleted(res, "generate");
   }, async (baseURL) => {
     await writeFile(configPath, JSON.stringify({ apiKey: "config-key", baseURL }));
     const { stdout } = await execFileAsync(process.execPath, [
@@ -274,9 +315,10 @@ test("request-file executes generate and edit without image command-line argumen
       assert.equal(req.url, "/v1/images/edits");
       assert.match(req.headers["content-type"], /^multipart\/form-data/);
       assert.match(body.toString("latin1"), /keep the image and change the scarf/);
+      assert.match(body.toString("latin1"), /name="stream"\r\n\r\ntrue/);
+      assert.match(body.toString("latin1"), /name="partial_images"\r\n\r\n0/);
     }
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    streamCompleted(res, req.url === "/v1/images/generations" ? "generate" : "edit");
   }, async (baseURL) => {
     await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "request-file-key", baseURL }));
     await writeFile(generateRequest, JSON.stringify({
@@ -407,12 +449,12 @@ test("request-file protocol rejects old prompt flags as structured JSON", async 
   }
   assert.ok(failure);
   assert.equal(failure.code, 1);
-  assert.equal(failure.stderr, "Usage: niucodes-image-gen run --request-file <absolute-request.json>\n");
+  assert.equal(failure.stderr, "Usage: niucodes-image-gen run --request-stdin\n");
   const result = JSON.parse(failure.stdout);
   assert.equal(result.status, "failed");
   assert.equal(result.command, "run");
   assert.equal(result.exit_code, 1);
-  assert.match(result.error.message, /request-file/);
+  assert.match(result.error.message, /request-stdin/);
 });
 
 test("request-file accepts a Windows UTF-8 BOM and keeps user data out of argv", async () => {
@@ -427,8 +469,7 @@ test("request-file accepts a Windows UTF-8 BOM and keeps user data out of argv",
   await withMockServer(async (req, res, body) => {
     assert.equal(req.url, "/v1/images/generations");
     assert.equal(JSON.parse(body).prompt, '中文 prompt with spaces and "quotes"');
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    streamCompleted(res, "generate");
   }, async (baseURL) => {
     await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "bom-test-key", baseURL }));
     await writeFile(requestPath, `\uFEFF${JSON.stringify({
@@ -449,6 +490,171 @@ test("request-file accepts a Windows UTF-8 BOM and keeps user data out of argv",
   });
 });
 
+test("request-stdin accepts a UTF-8 BOM, Chinese prompt, spaces, and quotes", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const outputPath = path.join(tempDir, "output folder", "generated image.png");
+  const statusPath = path.join(tempDir, "status folder", "generated status.json");
+  await mkdir(skillRoot, { recursive: true });
+
+  await withMockServer(async (req, res, body) => {
+    assert.equal(req.url, "/v1/images/generations");
+    const payload = JSON.parse(body);
+    assert.equal(payload.prompt, '中文 prompt with spaces and "quotes"');
+    assert.equal(payload.stream, true);
+    assert.equal(payload.partial_images, 0);
+    streamCompleted(res, "generate", { partialImages: 2 });
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "stdin-test-key", baseURL }));
+    const request = `\uFEFF${JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: '中文 prompt with spaces and "quotes"',
+      output: outputPath,
+      overwrite: true,
+    })}`;
+    const result = await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], request, {
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    });
+    assert.equal(result.stderr, "");
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.status, "success");
+    assert.equal(payload.timing_ms.stream_partial_events, 2);
+    assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), payload);
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+  });
+});
+
+test("an incomplete SSE stream fails once without retrying", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  await mkdir(skillRoot, { recursive: true });
+  let requestCount = 0;
+
+  await withMockServer(async (_req, res) => {
+    requestCount += 1;
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.end("data: [DONE]\\n\\n");
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "incomplete-stream-key", baseURL }));
+    let failure;
+    try {
+      await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], JSON.stringify({
+        version: 1,
+        command: "generate",
+        statusFile: statusPath,
+        prompt: "incomplete stream",
+        output: outputPath,
+        overwrite: true,
+      }), { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    assert.equal(failure.code, 1);
+    const result = JSON.parse(failure.stdout);
+    assert.equal(result.status, "failed");
+    assert.equal(result.stage, "request_or_save");
+    assert.match(result.error.message, /ended without/i);
+    assert.equal(requestCount, 1);
+    assert.equal(await exists(outputPath), false);
+    assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+  });
+});
+
+test("stream timeout aborts the open connection and writes a final failure", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  let closed = false;
+  await mkdir(skillRoot, { recursive: true });
+
+  await withMockServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`data: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: fixturePngBase64, partial_image_index: 0 })}\\n\\n`);
+    res.once("close", () => { closed = true; });
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "timeout-stream-key", baseURL, timeoutMs: 1000 }));
+    const startedAt = Date.now();
+    let failure;
+    try {
+      await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], JSON.stringify({
+        version: 1,
+        command: "generate",
+        statusFile: statusPath,
+        prompt: "timeout stream",
+        output: outputPath,
+        overwrite: true,
+      }), { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    assert.ok(Date.now() - startedAt < 4000);
+    const result = JSON.parse(failure.stdout);
+    assert.equal(result.status, "failed");
+    assert.match(result.error.message, /timed out after 1000ms/i);
+    assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), result);
+  });
+  assert.equal(closed, true);
+});
+
+test("SIGTERM closes an active stream and returns one final structured failure", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  await mkdir(skillRoot, { recursive: true });
+  let notifyRequestStarted;
+  const requestStarted = new Promise((resolve) => { notifyRequestStarted = resolve; });
+  let closed = false;
+
+  await withMockServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.write(`data: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: fixturePngBase64, partial_image_index: 0 })}\n\n`);
+    res.once("close", () => { closed = true; });
+    notifyRequestStarted();
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "signal-stream-key", baseURL, timeoutMs: 10000 }));
+    const child = spawn(process.execPath, [scriptPath, "run", "--request-stdin"], {
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.stdin.end(JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: "cancel stream",
+      output: outputPath,
+      overwrite: true,
+    }));
+    await requestStarted;
+    child.kill("SIGTERM");
+    const processResult = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    assert.equal(processResult.code, 1);
+    assert.equal(processResult.signal, null);
+    assert.equal(Buffer.concat(stderr).toString("utf8"), "Image request cancelled by SIGTERM.\n");
+    const payload = JSON.parse(Buffer.concat(stdout).toString("utf8"));
+    assert.equal(payload.status, "failed");
+    assert.equal(payload.stage, "request_or_save");
+    assert.match(payload.error.message, /cancelled by SIGTERM/i);
+    assert.deepEqual(JSON.parse(await readFile(statusPath, "utf8")), payload);
+  });
+  assert.equal(closed, true);
+});
+
 test("generate publishes a running then successful atomic status after a delayed API response", async () => {
   const tempDir = await createTempDir();
   const configPath = path.join(tempDir, "config.json");
@@ -459,8 +665,7 @@ test("generate publishes a running then successful atomic status after a delayed
   await withMockServer(async (_req, res) => {
     notifyRequestStarted();
     await new Promise((resolve) => setTimeout(resolve, 100));
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    streamCompleted(res, "generate");
   }, async (baseURL) => {
     await writeFile(configPath, JSON.stringify({ apiKey: "config-key", baseURL }));
     const command = execFileAsync(process.execPath, [
@@ -491,8 +696,9 @@ test("edit sends the configured SDK request as multipart", async () => {
     assert.equal(req.headers.authorization, "Bearer edit-key");
     assert.match(req.headers["content-type"], /^multipart\/form-data/);
     assert.match(body.toString("latin1"), /replace subject with a polished chrome vase/);
-    res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    assert.match(body.toString("latin1"), /name="stream"\r\n\r\ntrue/);
+    assert.match(body.toString("latin1"), /name="partial_images"\r\n\r\n0/);
+    streamCompleted(res, "edit");
   }, async (baseURL) => {
     await writeFile(configPath, JSON.stringify({ apiKey: "edit-key", baseURL, model: "gpt-image-1", quality: "low", outputFormat: "webp" }));
     const statusPath = path.join(tempDir, "edited.status.json");
@@ -588,8 +794,7 @@ test("configured HTTP proxy carries a generate request and closes its dispatcher
 
   await withMockServer(async (request, response) => {
     assert.equal(request.url, "/v1/images/generations");
-    response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+    streamCompleted(response, "generate");
   }, async (baseURL) => {
     await withHttpProxy(async (proxyUrl) => {
       await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "proxy-test-key", baseURL, proxyUrl }));

@@ -23,14 +23,15 @@ import {
 const HELP_TEXT = `niucodes-image-gen
 
 Usage:
-  niucodes-image-gen run --request-file "<absolute-request.json>"
+  niucodes-image-gen run --request-stdin
+  niucodes-image-gen run --request-file "<absolute-request.json>" (legacy compatibility)
   niucodes-image-gen generate --prompt "..." [options]
   niucodes-image-gen edit --image "<path>" --prompt "..." [options]
 
 Commands:
-  run         Execute one structured request file. This is the supported skill entrypoint.
-  generate    Call /v1/images/generations through the official OpenAI Node SDK.
-  edit        Call /v1/images/edits through the official OpenAI Node SDK.
+  run         Execute one structured request through the native streaming entrypoint.
+  generate    Call /v1/images/generations as an SSE stream through the OpenAI Node SDK.
+  edit        Call /v1/images/edits as an SSE stream through the OpenAI Node SDK.
 
 Common options:
   --config <path>               JSON config path. Defaults to <skill-dir>/config.json.
@@ -275,14 +276,29 @@ async function readStatusFile(statusFile) {
   }
 }
 
-function parseRequestFile(contents, requestPath) {
+function parseRequestJson(contents, requestSource) {
   // Windows PowerShell 5.1 commonly writes UTF-8 JSON with a BOM.
   const json = contents.charCodeAt(0) === 0xfeff ? contents.slice(1) : contents;
   try {
     return JSON.parse(json);
   } catch {
-    throw new Error(`Invalid JSON request file: ${requestPath}`);
+    throw new Error(`Invalid JSON request: ${requestSource}`);
   }
+}
+
+async function readRequestStdin() {
+  const chunks = [];
+  let byteLength = 0;
+  for await (const chunk of process.stdin) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    byteLength += bytes.length;
+    if (byteLength > 1024 * 1024) {
+      throw new Error("Request stdin exceeds the 1 MiB limit.");
+    }
+    chunks.push(bytes);
+  }
+  if (byteLength === 0) throw new Error("Request stdin was empty.");
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, clientRequestId = null, exitCode = null, stage }) {
@@ -360,26 +376,32 @@ function requestFailurePayload(command, message, startedAt, startedAtPerformance
   });
 }
 
-async function runRequestFile(argv, { cwd = process.cwd() } = {}) {
+async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
   const startedAt = new Date().toISOString();
   const startedAtPerformance = performance.now();
   let statusFile;
   let command = "run";
 
   try {
-    if (argv.length !== 2 || argv[0] !== "--request-file" || !argv[1]) {
-      throw new Error("Usage: niucodes-image-gen run --request-file <absolute-request.json>");
+    let rawRequest;
+    let requestSource;
+    if (argv.length === 1 && argv[0] === "--request-stdin") {
+      requestSource = "stdin";
+      rawRequest = parseRequestJson(await readRequestStdin(), requestSource);
+    } else if (argv.length === 2 && argv[0] === "--request-file" && argv[1]) {
+      if (!path.isAbsolute(argv[1])) {
+        throw new Error("Request file must be an absolute path.");
+      }
+      requestSource = path.resolve(argv[1]);
+      rawRequest = parseRequestJson(await readFile(requestSource, "utf8"), requestSource);
+    } else {
+      throw new Error("Usage: niucodes-image-gen run --request-stdin");
     }
-    if (!path.isAbsolute(argv[1])) {
-      throw new Error("Request file must be an absolute path.");
-    }
-    const requestPath = path.resolve(argv[1]);
-    const rawRequest = parseRequestFile(await readFile(requestPath, "utf8"), requestPath);
     if (rawRequest && typeof rawRequest === "object" && !Array.isArray(rawRequest)
       && typeof rawRequest.statusFile === "string" && path.isAbsolute(rawRequest.statusFile)) {
       statusFile = path.resolve(rawRequest.statusFile);
     }
-    const request = toRequestObject(rawRequest, requestPath);
+    const request = toRequestObject(rawRequest, requestSource);
     command = request.command;
     statusFile = request.options.statusFile;
     const payload = await executeImageCommand(command, request.options, { cwd });
@@ -432,7 +454,13 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       stage: "request",
       clientRequestId,
     }));
-    const { response: apiResponse, inputPrepareMs, apiDurationMs } = await createImageRequest(invocation, { clientRequestId });
+    const {
+      response: apiResponse,
+      inputPrepareMs,
+      apiDurationMs,
+      streamFirstEventMs,
+      streamPartialEventCount,
+    } = await createImageRequest(invocation, { clientRequestId });
     const outputStartedAt = performance.now();
     const outputTargets = await resolveOutputTargets({
       command: invocation.command,
@@ -459,6 +487,8 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         resolve: resolveDurationMs,
         input_prepare: inputPrepareMs,
         api: apiDurationMs,
+        stream_first_event: streamFirstEventMs,
+        stream_partial_events: streamPartialEventCount,
         output_prepare: outputPrepareMs,
         save: saveDurationMs,
         non_api: totalMs - apiDurationMs,
@@ -495,7 +525,7 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
 
 export async function runCli(argv, { cwd = process.cwd() } = {}) {
   if (argv[0] === "run") {
-    return runRequestFile(argv.slice(1), { cwd });
+    return runStructuredRequest(argv.slice(1), { cwd });
   }
   const parsed = parseArgs(argv);
   if (parsed.help) {
@@ -508,4 +538,4 @@ export async function runCli(argv, { cwd = process.cwd() } = {}) {
   return 0;
 }
 
-export { HELP_TEXT, parseArgs, runRequestFile, toRequestObject };
+export { HELP_TEXT, parseArgs, runStructuredRequest, toRequestObject };

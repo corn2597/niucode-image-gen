@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -34,24 +34,51 @@ async function exists(filePath) {
   }
 }
 
-async function runNative(executable, requestFile) {
-  return execFileAsync(executable, ["run", "--request-file", requestFile], {
-    encoding: "utf8",
-    windowsHide: true,
+async function runNativeWithStdin(executable, requestJson) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ["run", "--request-stdin"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      const result = {
+        code,
+        signal,
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+      };
+      if (code === 0) resolve(result);
+      else reject(Object.assign(new Error(`Native process exited with ${code ?? signal}`), result));
+    });
+    child.stdin.end(requestJson, "utf8");
   });
 }
 
-async function runNativeViaPowerShell(executable, requestFile) {
-  if (process.platform !== "win32") return runNative(executable, requestFile);
+async function runNativeViaPowerShell(executable, requestJson) {
+  if (process.platform !== "win32") return runNativeWithStdin(executable, requestJson);
 
-  // Encode paths instead of interpolating them into PowerShell source. This
-  // verifies the user-facing `& exe run --request-file <path>` boundary with
-  // Chinese and space-containing paths while keeping request content off argv.
+  // The encoded script preserves Chinese JSON and verifies the exact native
+  // stdin boundary used by Windows Codex, without any .ps1 runner.
   const script = [
     `$exe = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(executable, "utf8").toString("base64")}'))`,
-    `$request = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(requestFile, "utf8").toString("base64")}'))`,
-    "& $exe run --request-file $request",
-    "exit $LASTEXITCODE",
+    `$request = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(requestJson, "utf8").toString("base64")}'))`,
+    "$utf8 = [System.Text.UTF8Encoding]::new($false)",
+    "$previousOutputEncoding = $OutputEncoding",
+    "$exitCode = 1",
+    "try {",
+    "  $OutputEncoding = $utf8",
+    "  [Console]::OutputEncoding = $utf8",
+    "  $request | & $exe run --request-stdin",
+    "  $exitCode = $LASTEXITCODE",
+    "} finally {",
+    "  $OutputEncoding = $previousOutputEncoding",
+    "}",
+    "exit $exitCode",
   ].join("\n");
   const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
   return execFileAsync("pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encodedCommand], {
@@ -100,8 +127,17 @@ async function withMockImagesApi(handler, run) {
   }
 }
 
-async function assertSuccessfulRequest(executable, requestFile, statusFile, outputFile, runner = runNative) {
-  const { stdout, stderr } = await runner(executable, requestFile);
+function streamCompleted(response, command) {
+  const prefix = command === "generate" ? "image_generation" : "image_edit";
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "x-request-id": `packaged-${prefix}-request`,
+  });
+  response.end(`data: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 })}\n\ndata: [DONE]\n\n`);
+}
+
+async function assertSuccessfulRequest(executable, requestJson, statusFile, outputFile, runner = runNativeWithStdin) {
+  const { stdout, stderr } = await runner(executable, requestJson);
   assert.equal(stderr, "");
   const result = JSON.parse(stdout);
   assert.equal(result.status, "success");
@@ -150,6 +186,8 @@ await withMockImagesApi(async (request, response, body) => {
   assert.match(request.headers["x-niucodes-client-request-id"], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
   if (request.url === "/v1/images/generations") {
     const payload = JSON.parse(body);
+    assert.equal(payload.stream, true);
+    assert.equal(payload.partial_images, 0);
     assert.ok([
       '中文生成 prompt with spaces and "quotes"',
       'installed package prompt with spaces and "quotes"',
@@ -158,9 +196,10 @@ await withMockImagesApi(async (request, response, body) => {
     assert.equal(request.url, "/v1/images/edits");
     assert.match(request.headers["content-type"], /^multipart\/form-data/);
     assert.match(body.toString("latin1"), /keep composition and change scarf to blue/);
+    assert.match(body.toString("latin1"), /name="stream"\r\n\r\ntrue/);
+    assert.match(body.toString("latin1"), /name="partial_images"\r\n\r\n0/);
   }
-  response.setHeader("content-type", "application/json");
-  response.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  streamCompleted(response, request.url === "/v1/images/generations" ? "generate" : "edit");
 }, async (baseURL) => {
   await writeFile(path.join(packageRoot, "config.json"), JSON.stringify({ apiKey: "packaged-e2e-key", baseURL }));
   await writeFile(generateRequest, `\uFEFF${JSON.stringify({
@@ -173,7 +212,7 @@ await withMockImagesApi(async (request, response, body) => {
     size: "1024x1024",
     overwrite: true,
   })}`);
-  await assertSuccessfulRequest(executable, generateRequest, generateStatus, generatedImage);
+  await assertSuccessfulRequest(executable, await readFile(generateRequest, "utf8"), generateStatus, generatedImage);
 
   await writeFile(editRequest, JSON.stringify({
     version: 1,
@@ -186,16 +225,16 @@ await withMockImagesApi(async (request, response, body) => {
     size: "1024x1024",
     overwrite: true,
   }));
-  await assertSuccessfulRequest(executable, editRequest, editStatus, editedImage);
+  await assertSuccessfulRequest(executable, await readFile(editRequest, "utf8"), editStatus, editedImage);
 
   if (process.platform === "win32") {
-    await assertSuccessfulRequest(executable, generateRequest, generateStatus, generatedImage, runNativeViaPowerShell);
-    await assertSuccessfulRequest(executable, editRequest, editStatus, editedImage, runNativeViaPowerShell);
+    await assertSuccessfulRequest(executable, await readFile(generateRequest, "utf8"), generateStatus, generatedImage, runNativeViaPowerShell);
+    await assertSuccessfulRequest(executable, await readFile(editRequest, "utf8"), editStatus, editedImage, runNativeViaPowerShell);
   }
 
   const installResult = JSON.parse((await runNativeInstall(executable, installedSkill, installedConfigPath)).stdout);
   assert.equal(installResult.status, "success");
-  assert.equal(installResult.protocol, "request-file-v1");
+  assert.equal(installResult.protocol, "stream-stdin-v2");
   assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.ps1")), false);
   assert.equal(await exists(path.join(installedSkill, "scripts", "invoke-imagegen.sh")), false);
   assert.equal(await exists(path.join(installedSkill, "scripts")), false);
@@ -214,7 +253,7 @@ await withMockImagesApi(async (request, response, body) => {
     size: "1024x1024",
     overwrite: true,
   }));
-  await assertSuccessfulRequest(path.join(installedSkill, "bin", binaryName()), installedRequest, installedStatus, installedOutput);
+  await assertSuccessfulRequest(path.join(installedSkill, "bin", binaryName()), await readFile(installedRequest, "utf8"), installedStatus, installedOutput);
 });
 
 assert.equal(requestCount, process.platform === "win32" ? 5 : 3);
