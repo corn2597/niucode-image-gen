@@ -616,7 +616,11 @@ test("stream timeout aborts the open connection and writes a final failure", asy
   assert.equal(closed, true);
 });
 
-test("SIGTERM closes an active stream and returns one final structured failure", async () => {
+test("SIGTERM closes an active stream and returns one final structured failure", {
+  // Windows terminates a child process for SIGTERM instead of delivering a
+  // catchable POSIX signal, so this lifecycle contract is not observable there.
+  skip: process.platform === "win32",
+}, async () => {
   const tempDir = await createTempDir();
   const skillRoot = path.join(tempDir, "skill root");
   const statusPath = path.join(tempDir, "status.json");
