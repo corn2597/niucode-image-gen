@@ -5,7 +5,7 @@ The script asks for the API key without displaying it, verifies the release SHA-
 installs into Codex, then writes config.json. It does not call the image API.
 
 macOS:
-  curl -fLO https://gitee.com/niucodes/niucode-image-gen/raw/main/install-macos.command
+  curl -fL https://gitee.com/niucodes/niucode-image-gen/raw/main/install-macos.command -o install-macos.command
   chmod +x install-macos.command && ./install-macos.command
 
 Windows PowerShell:
