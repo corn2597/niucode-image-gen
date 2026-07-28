@@ -28,17 +28,14 @@ const platforms = [
   {
     id: "macos-arm64",
     binary: "niucodes-image-gen-macos-arm64",
-    installer: "install-macos-arm64.command",
   },
   {
     id: "macos-x64",
     binary: "niucodes-image-gen-macos-x64",
-    installer: "install-macos-x64.command",
   },
   {
     id: "win-x64",
     binary: "niucodes-image-gen-win-x64.exe",
-    installer: "install-windows.cmd",
   },
 ];
 
@@ -62,10 +59,8 @@ async function makePackage(destinationRoot, selectedPlatforms) {
   }
   for (const platform of selectedPlatforms) {
     await copyFile(path.join("bin", platform.binary), destinationRoot);
-    await copyFile(path.join("scripts", platform.installer), destinationRoot);
     if (platform.id.startsWith("macos")) {
       await chmod(path.join(destinationRoot, "bin", platform.binary), 0o755);
-      await chmod(path.join(destinationRoot, "scripts", platform.installer), 0o755);
     }
   }
 }
