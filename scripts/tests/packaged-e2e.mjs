@@ -25,6 +25,19 @@ function binaryName() {
   throw new Error(`Unsupported E2E platform: ${process.platform}-${process.arch}`);
 }
 
+function executablePath(packageRoot) {
+  return process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE
+    ? path.resolve(process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE)
+    : path.join(packageRoot, "bin", binaryName());
+}
+
+function nativeCommand(executable, args) {
+  if (process.env.NIUCODES_IMAGE_GEN_E2E_ROSETTA === "1") {
+    return { file: "arch", args: ["-x86_64", executable, ...args] };
+  }
+  return { file: executable, args };
+}
+
 async function exists(filePath) {
   try {
     await stat(filePath);
@@ -35,8 +48,9 @@ async function exists(filePath) {
 }
 
 async function runNativeWithStdin(executable, requestJson) {
+  const command = nativeCommand(executable, ["run", "--request-stdin"]);
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, ["run", "--request-stdin"], {
+    const child = spawn(command.file, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -102,11 +116,12 @@ async function findPowerShellScripts(directory) {
 }
 
 async function runNativeInstall(executable, installDir, configPath) {
-  return execFileAsync(executable, [
+  const command = nativeCommand(executable, [
     "install",
     "--install-dir", installDir,
     "--config-path", configPath,
-  ], {
+  ]);
+  return execFileAsync(command.file, command.args, {
     encoding: "utf8",
     windowsHide: true,
   });
@@ -133,7 +148,10 @@ function streamCompleted(response, command) {
     "content-type": "text/event-stream; charset=utf-8",
     "x-request-id": `packaged-${prefix}-request`,
   });
-  response.end(`data: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 })}\n\ndata: [DONE]\n\n`);
+  // Keep the transport open and deliberately omit both LF and the blank SSE
+  // delimiter. Packaged runners must save once the complete JSON/Base64 bytes
+  // arrive instead of waiting for a proxy to close the response.
+  response.write(`data: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 })}`);
 }
 
 async function assertSuccessfulRequest(executable, requestJson, statusFile, outputFile, runner = runNativeWithStdin) {
@@ -147,7 +165,7 @@ async function assertSuccessfulRequest(executable, requestJson, statusFile, outp
 }
 
 const packageRoot = readPackageRoot(process.argv.slice(2));
-const executable = path.join(packageRoot, "bin", binaryName());
+const executable = executablePath(packageRoot);
 if (!(await exists(executable))) throw new Error(`Packaged executable was not found: ${executable}`);
 assert.deepEqual(await findPowerShellScripts(packageRoot), [], "Release package must not contain PowerShell scripts.");
 if (await exists(path.join(packageRoot, "scripts", "invoke-imagegen.sh"))) {
@@ -253,7 +271,7 @@ await withMockImagesApi(async (request, response, body) => {
     size: "1024x1024",
     overwrite: true,
   }));
-  await assertSuccessfulRequest(path.join(installedSkill, "bin", binaryName()), await readFile(installedRequest, "utf8"), installedStatus, installedOutput);
+  await assertSuccessfulRequest(path.join(installedSkill, "bin", path.basename(executable)), await readFile(installedRequest, "utf8"), installedStatus, installedOutput);
 });
 
 assert.equal(requestCount, process.platform === "win32" ? 5 : 3);

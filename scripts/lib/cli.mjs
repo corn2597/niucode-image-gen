@@ -30,13 +30,13 @@ Usage:
 
 Commands:
   run         Execute one structured request through the native streaming entrypoint.
-  generate    Call /v1/images/generations as an SSE stream through the OpenAI Node SDK.
-  edit        Call /v1/images/edits as an SSE stream through the OpenAI Node SDK.
+  generate    Call /v1/images/generations as an HTTP SSE stream.
+  edit        Call /v1/images/edits as an HTTP SSE stream.
 
 Common options:
   --config <path>               JSON config path. Defaults to <skill-dir>/config.json.
                                 apiKey is read only from this config file.
-  --base-url <url>              SDK baseURL. Defaults to ${DEFAULT_BASE_URL}.
+  --base-url <url>              Image API base URL. Defaults to ${DEFAULT_BASE_URL}.
   --model <model>               Defaults to gpt-image-2.
   --output <file-or-dir>        Required. Output file or directory outside the skill directory.
   --output-format <fmt>         png | jpeg | webp
@@ -47,7 +47,7 @@ Common options:
   --moderation <value>          auto | low
   --n <count>                   Number of images to save. Default: 1
   --overwrite                   Overwrite the first output path if it already exists.
-  --timeout-ms <ms>             SDK timeout in milliseconds. Default: 600000
+  --timeout-ms <ms>             End-to-end request timeout in milliseconds. Default: 600000
   --status-file <path>          Optional JSON lifecycle file. Written atomically after each state change.
   --verbose-response            Include expanded request/response metadata in the JSON output.
 
@@ -458,7 +458,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       response: apiResponse,
       inputPrepareMs,
       apiDurationMs,
-      streamFirstEventMs,
+      streamFirstByteMs,
+      streamCompletedPayloadMs,
+      streamCompletedFrameTerminated,
       streamPartialEventCount,
     } = await createImageRequest(invocation, { clientRequestId });
     const outputStartedAt = performance.now();
@@ -487,7 +489,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         resolve: resolveDurationMs,
         input_prepare: inputPrepareMs,
         api: apiDurationMs,
-        stream_first_event: streamFirstEventMs,
+        stream_first_byte: streamFirstByteMs,
+        stream_completed_payload: streamCompletedPayloadMs,
+        stream_completed_frame_terminated: streamCompletedFrameTerminated,
         stream_partial_events: streamPartialEventCount,
         output_prepare: outputPrepareMs,
         save: saveDurationMs,

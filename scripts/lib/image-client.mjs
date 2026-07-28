@@ -1,36 +1,13 @@
-import { File as BufferFile } from "node:buffer";
-import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
-import OpenAI, { toFile } from "openai";
-
-export function suppressBufferFileExperimentalWarning(runtime = process) {
-  const emitWarning = runtime?.emitWarning;
-  if (typeof emitWarning !== "function") return;
-
-  runtime.emitWarning = (warning, type, ...rest) => {
-    if (type === "ExperimentalWarning" && String(warning).includes("buffer.File")) return;
-    return emitWarning.call(runtime, warning, type, ...rest);
-  };
-}
-
-// Node 18 exposes File via node:buffer but not consistently as a global.
-if (typeof globalThis.File === "undefined") {
-  // Node 18 emits this warning whenever the SDK creates a multipart File.
-  // The native runner reserves stderr for structured execution diagnostics.
-  suppressBufferFileExperimentalWarning();
-  Object.defineProperty(globalThis, "File", {
-    configurable: true,
-    value: BufferFile,
-    writable: true,
-  });
-}
+import { File, FormData, ProxyAgent, fetch } from "undici";
 
 export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
+const MAX_STREAM_BYTES = 100 * 1024 * 1024;
 
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -155,15 +132,12 @@ async function readConfigFile(configPath, cwd) {
 
 async function assertLocalFile(filePath) {
   const resolved = path.resolve(filePath);
-  const stream = createReadStream(resolved);
   try {
-    await new Promise((resolve, reject) => {
-      stream.once("open", resolve);
-      stream.once("error", reject);
-    });
+    await readFile(resolved);
     return resolved;
-  } finally {
-    stream.destroy();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read image file: ${resolved} (${detail})`);
   }
 }
 
@@ -179,7 +153,8 @@ function detectMimeType(filePath) {
 
 async function toUploadable(filePath) {
   const resolved = await assertLocalFile(filePath);
-  return toFile(createReadStream(resolved), path.basename(resolved), { type: detectMimeType(resolved) });
+  const bytes = await readFile(resolved);
+  return new File([bytes], path.basename(resolved), { type: detectMimeType(resolved) });
 }
 
 function trimTrailingSlash(value) {
@@ -247,43 +222,159 @@ function partialEventType(command) {
   return command === "generate" ? "image_generation.partial_image" : "image_edit.partial_image";
 }
 
-async function consumeImageStream(stream, invocation, lifecycle) {
-  const completed = [];
-  let firstEventMs = null;
-  let partialEventCount = 0;
+class ImageHttpError extends Error {
+  constructor(message, { status, requestId, code, cause, deliveryUnknown = false } = {}) {
+    super(message, cause ? { cause } : undefined);
+    this.name = "ImageHttpError";
+    if (status !== undefined) this.status = status;
+    if (requestId) this.request_id = requestId;
+    if (code) this.code = code;
+    this.deliveryUnknown = deliveryUnknown;
+  }
+}
+
+function parseCompletedPayload(payload, expectedCompletedType) {
+  let event;
+  try {
+    event = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (event?.type !== expectedCompletedType) return null;
+  if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
+    throw new Error("Image stream completed without image data.");
+  }
+  return event;
+}
+
+function extractDataPayload(line) {
+  if (!line.startsWith("data:")) return null;
+  return line.slice(5).replace(/^ /, "");
+}
+
+async function consumeImageStream(response, invocation, lifecycle) {
+  if (!response.body) throw new ImageHttpError("Image API returned an empty response body.", { status: response.status });
+
+  const decoder = new TextDecoder("utf-8");
+  const reader = response.body.getReader();
   const expectedCompletedType = completedEventType(invocation.command);
   const expectedPartialType = partialEventType(invocation.command);
+  const dataLines = [];
+  let pending = "";
+  let firstByteMs = null;
+  let partialEventCount = 0;
+  let byteCount = 0;
 
-  lifecycle.addAbortListener(() => stream.controller.abort());
-  try {
-    for await (const event of stream) {
-      lifecycle.throwIfAborted();
-      if (firstEventMs === null) firstEventMs = Math.round(performance.now());
-
+  const inspectPayload = (payload, frameTerminated) => {
+    if (!payload || payload === "[DONE]") return null;
+    const completed = parseCompletedPayload(payload, expectedCompletedType);
+    if (completed) {
+      return {
+        completed: [{ b64_json: completed.b64_json, revised_prompt: completed.revised_prompt ?? null }],
+        firstByteMs,
+        completedPayloadMs: Math.round(performance.now()),
+        completedFrameTerminated: frameTerminated,
+        partialEventCount,
+      };
+    }
+    try {
+      const event = JSON.parse(payload);
       if (event?.type === expectedPartialType) {
         partialEventCount += 1;
-        continue;
+        return null;
       }
-      if (event?.type === expectedCompletedType) {
-        if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
-          throw new Error("Image stream completed without image data.");
-        }
-        completed.push({
-          b64_json: event.b64_json,
-          revised_prompt: event.revised_prompt ?? null,
-        });
-        continue;
+      if (event?.type) {
+        throw new Error(`Image stream returned an unsupported event: ${String(event.type)}.`);
       }
-      throw new Error(`Image stream returned an unsupported event: ${String(event?.type ?? "unknown")}.`);
+    } catch (error) {
+      if (error instanceof SyntaxError) return null;
+      throw error;
     }
+    return null;
+  };
+
+  const inspectOpenFrame = () => {
+    const payload = dataLines.join("\n");
+    if (!payload || payload === "[DONE]") return null;
+    const completed = parseCompletedPayload(payload, expectedCompletedType);
+    if (!completed) return null;
+    return {
+      completed: [{ b64_json: completed.b64_json, revised_prompt: completed.revised_prompt ?? null }],
+      firstByteMs,
+      completedPayloadMs: Math.round(performance.now()),
+      completedFrameTerminated: false,
+      partialEventCount,
+    };
+  };
+  const processLine = (line) => {
+    if (line === "") {
+      const result = inspectPayload(dataLines.join("\n"), true);
+      dataLines.length = 0;
+      return result;
+    }
+    const data = extractDataPayload(line);
+    if (data !== null) {
+      dataLines.push(data);
+      // Some proxies transmit a syntactically complete JSON event but never
+      // append the blank SSE frame delimiter. A valid completed payload is
+      // sufficient to persist the final image immediately.
+      return inspectOpenFrame();
+    }
+    return null;
+  };
+
+  lifecycle.addAbortListener(() => {
+    void reader.cancel().catch(() => undefined);
+  });
+
+  try {
+    for (;;) {
+      lifecycle.throwIfAborted();
+      const { done, value } = await reader.read();
+      lifecycle.throwIfAborted();
+      if (done) break;
+      if (firstByteMs === null) firstByteMs = Math.round(performance.now());
+      byteCount += value.byteLength;
+      if (byteCount > MAX_STREAM_BYTES) {
+        throw new Error(`Image stream exceeded the ${MAX_STREAM_BYTES} byte limit.`);
+      }
+      pending += decoder.decode(value, { stream: true });
+
+      let newlineIndex;
+      while ((newlineIndex = pending.indexOf("\n")) !== -1) {
+        const rawLine = pending.slice(0, newlineIndex);
+        pending = pending.slice(newlineIndex + 1);
+        const completed = processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+        if (completed) return completed;
+      }
+
+      // Also allow a completed `data:` JSON object that ends exactly at a
+      // transport chunk boundary without either an LF or a blank SSE line.
+      const pendingData = extractDataPayload(pending);
+      const completed = pendingData === null
+        ? inspectOpenFrame()
+        : (() => {
+          dataLines.push(pendingData);
+          const result = inspectOpenFrame();
+          dataLines.pop();
+          return result;
+        })();
+      if (completed) return completed;
+    }
+
+    pending += decoder.decode();
+    if (pending) {
+      const completed = processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
+      if (completed) return completed;
+    }
+    const completed = inspectPayload(dataLines.join("\n"), false);
+    if (completed) return completed;
   } finally {
+    await reader.cancel().catch(() => undefined);
     lifecycle.throwIfAborted();
   }
 
-  if (completed.length === 0) {
-    throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
-  }
-  return { completed, firstEventMs, partialEventCount };
+  throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
 }
 
 export async function resolveInvocation(command, cliOptions, { cwd = process.cwd() } = {}) {
@@ -337,27 +428,60 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   return invocation;
 }
 
-async function createClient(invocation, clientRequestId) {
-  let dispatcher;
-  let fetch;
-  if (invocation.proxyUrl) {
-    // Import only for configured proxy users. Loading undici's global
-    // dispatcher on ordinary direct requests can keep native runners alive.
-    const { fetch: undiciFetch, ProxyAgent } = await import("undici");
-    dispatcher = new ProxyAgent(invocation.proxyUrl);
-    fetch = (url, init) => undiciFetch(url, { ...init, dispatcher });
+function definedJsonPayload(payload) {
+  return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+}
+
+function appendFormValue(form, key, value) {
+  if (value !== undefined && value !== null) form.append(key, String(value));
+}
+
+async function createRequestBody(invocation) {
+  const payload = {
+    ...applySharedPayload(invocation),
+    // The API emits exactly one final image event. Extra partial previews add
+    // image output tokens and do not make the final result available sooner.
+    stream: true,
+    partial_images: 0,
+  };
+  if (invocation.command === "generate") {
+    return { body: JSON.stringify(definedJsonPayload(payload)), contentType: "application/json" };
   }
 
+  const preparationStartedAt = performance.now();
+  const form = new FormData();
+  for (const [key, value] of Object.entries(payload)) appendFormValue(form, key, value);
+  const images = await Promise.all(invocation.images.map((filePath) => toUploadable(path.resolve(invocation.cwd, filePath))));
+  for (const image of images) form.append("image", image);
+  if (invocation.mask) form.append("mask", await toUploadable(path.resolve(invocation.cwd, invocation.mask)));
+  if (invocation.inputFidelity) appendFormValue(form, "input_fidelity", invocation.inputFidelity);
+  return { body: form, inputPrepareMs: Math.round(performance.now() - preparationStartedAt) };
+}
+
+function requestIdFromResponse(response) {
+  return response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? null;
+}
+
+async function responseError(response, requestId) {
+  const contentType = response.headers.get("content-type") ?? "";
+  const body = await response.text();
+  let message;
+  if (contentType.includes("json")) {
+    try {
+      const parsed = JSON.parse(body);
+      message = parsed?.error?.message ?? parsed?.message;
+    } catch {
+      // The bounded plain-text fallback below is sufficient for invalid JSON.
+    }
+  }
+  message ??= body.trim().slice(0, 1000) || `Image API returned HTTP ${response.status}.`;
+  return new ImageHttpError(message, { status: response.status, requestId });
+}
+
+async function createTransport(proxyUrl) {
+  const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : null;
   return {
-    client: new OpenAI({
-      apiKey: invocation.apiKey,
-      baseURL: invocation.baseURL,
-      // This wrapper favors returning a failure promptly over hidden retry delays.
-      maxRetries: 0,
-      timeout: invocation.timeoutMs,
-      defaultHeaders: { "X-Niucodes-Client-Request-Id": clientRequestId },
-      ...(fetch ? { fetch } : {}),
-    }),
+    dispatcher,
     async close() {
       if (dispatcher) await dispatcher.close();
     },
@@ -365,56 +489,51 @@ async function createClient(invocation, clientRequestId) {
 }
 
 export async function createImageRequest(invocation, { clientRequestId } = {}) {
-  const { client, close } = await createClient(invocation, clientRequestId);
+  const transport = await createTransport(invocation.proxyUrl);
   const lifecycle = createRequestLifecycle(invocation.timeoutMs);
   try {
-    const payload = {
-      ...applySharedPayload(invocation),
-      // The API emits exactly one final image event. Extra partial previews add
-      // image output tokens and do not make the final result available sooner.
-      stream: true,
-      partial_images: 0,
-    };
-    if (invocation.command === "generate") {
-      const apiStartedAt = performance.now();
-      const request = client.images.generate(payload, { signal: lifecycle.signal });
-      const { data: stream, request_id: requestId } = await request.withResponse();
-      const consumed = await consumeImageStream(stream, invocation, lifecycle);
-      return {
-        response: { data: consumed.completed, _request_id: requestId },
-        inputPrepareMs: 0,
-        apiDurationMs: Math.round(performance.now() - apiStartedAt),
-        streamFirstEventMs: consumed.firstEventMs === null ? null : Math.max(0, consumed.firstEventMs - Math.round(apiStartedAt)),
-        streamPartialEventCount: consumed.partialEventCount,
-      };
-    }
-
-    const preparationStartedAt = performance.now();
-    const images = await Promise.all(invocation.images.map((filePath) => toUploadable(path.resolve(invocation.cwd, filePath))));
-    const editPayload = { ...payload, image: images.length === 1 ? images[0] : images };
-    if (invocation.mask) editPayload.mask = await toUploadable(path.resolve(invocation.cwd, invocation.mask));
-    if (invocation.inputFidelity) editPayload.input_fidelity = invocation.inputFidelity;
-    const inputPrepareMs = Math.round(performance.now() - preparationStartedAt);
+    const { body, contentType, inputPrepareMs = 0 } = await createRequestBody(invocation);
     lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
-    const request = client.images.edit(editPayload, { signal: lifecycle.signal });
-    const { data: stream, request_id: requestId } = await request.withResponse();
-    const consumed = await consumeImageStream(stream, invocation, lifecycle);
+    let response;
+    try {
+      response = await fetch(`${invocation.baseURL}/images/${invocation.command === "generate" ? "generations" : "edits"}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${invocation.apiKey ?? ""}`,
+          "X-Niucodes-Client-Request-Id": clientRequestId,
+          ...(contentType ? { "Content-Type": contentType } : {}),
+        },
+        body,
+        signal: lifecycle.signal,
+        ...(transport.dispatcher ? { dispatcher: transport.dispatcher } : {}),
+      });
+    } catch (error) {
+      lifecycle.throwIfAborted();
+      throw new ImageHttpError("Image API connection error.", {
+        code: error?.cause?.code ?? error?.code,
+        cause: error,
+        deliveryUnknown: true,
+      });
+    }
+    const requestId = requestIdFromResponse(response);
+    if (!response.ok) throw await responseError(response, requestId);
+    const consumed = await consumeImageStream(response, invocation, lifecycle);
     return {
       response: { data: consumed.completed, _request_id: requestId },
       inputPrepareMs,
       apiDurationMs: Math.round(performance.now() - apiStartedAt),
-      streamFirstEventMs: consumed.firstEventMs === null ? null : Math.max(0, consumed.firstEventMs - Math.round(apiStartedAt)),
+      streamFirstByteMs: consumed.firstByteMs === null ? null : Math.max(0, consumed.firstByteMs - Math.round(apiStartedAt)),
+      streamCompletedPayloadMs: Math.max(0, consumed.completedPayloadMs - Math.round(apiStartedAt)),
+      streamCompletedFrameTerminated: consumed.completedFrameTerminated,
       streamPartialEventCount: consumed.partialEventCount,
     };
   } catch (error) {
-    // The SDK wraps an aborted fetch as APIConnectionError. Preserve the
-    // deterministic local cancellation reason instead of marking it delivery-unknown.
     lifecycle.throwIfAborted();
     throw error;
   } finally {
     lifecycle.dispose();
-    await close();
+    await transport.close();
   }
 }
 
@@ -437,7 +556,7 @@ function transportCause(error) {
 }
 
 export function isRequestDeliveryUnknown(error) {
-  return error?.name === "APIConnectionError" || error?.constructor?.name === "APIConnectionError";
+  return error?.deliveryUnknown === true;
 }
 
 export function describeOpenAIError(error) {

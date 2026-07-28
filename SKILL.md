@@ -5,9 +5,11 @@ description: Direct native OpenAI Images generation and editing through one stre
 
 # niucodes image gen
 
-This skill is a direct Images API wrapper. Run exactly one bundled native executable for each user request. It sends the request as an HTTP SSE image stream with `partial_images: 0`, consumes its final completed event, and saves the final image. Do not use an MCP tool, PowerShell runner, extra LLM prompt processing, API preflight, retry, image read, or a second image request.
+This skill is a direct Images API wrapper. Run exactly one bundled native executable for each user request. Its embedded HTTP client sends an SSE image stream with `partial_images: 0`, saves as soon as a complete final JSON/Base64 payload arrives (even if a proxy omits the SSE blank-line delimiter), and then closes the response without waiting for EOF. Do not use an MCP tool, PowerShell runner, extra LLM prompt processing, API preflight, retry, image read, or a second image request.
 
 The installed skill root is `${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen` on macOS and `$env:USERPROFILE\.codex\skills\niucodes-image-gen` on Windows. Its executable is in that root's `bin` directory. On Apple Silicon use `niucodes-image-gen-macos-arm64`; on Intel macOS use `niucodes-image-gen-macos-x64`; on Windows use `niucodes-image-gen-win-x64.exe`.
+
+Unless the user explicitly specifies an output location, save images and status files under `$HOME/Pictures/niucodes-image-gen` on macOS or `$env:USERPROFILE\Pictures\niucodes-image-gen` on Windows. Create that directory when needed. Never default to the current workspace, a repository, the skill directory, or a temporary directory: the final `saved[*].markdown` path must remain available for the user to render after the task ends.
 
 Build one UTF-8 JSON object with absolute paths. Preserve the user prompt verbatim. Include `image` only for `edit`; set `quality` to `low` unless the user requested another quality. `statusFile` is required and is only a final-result recovery file.
 

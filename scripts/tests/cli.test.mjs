@@ -15,7 +15,6 @@ import {
   DEFAULT_GENERATE_SIZE,
   resolveConfigPath,
   resolveInvocation,
-  suppressBufferFileExperimentalWarning,
 } from "../lib/image-client.mjs";
 import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs";
 
@@ -104,6 +103,11 @@ function streamCompleted(response, command, { partialImages = 0 } = {}) {
   response.end(`data: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 })}\n\ndata: [DONE]\n\n`);
 }
 
+function completedPayload(command) {
+  const prefix = command === "generate" ? "image_generation" : "image_edit";
+  return JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64 });
+}
+
 async function withHttpProxy(run) {
   const proxy = createServer((request, response) => {
     const target = new URL(request.url);
@@ -152,8 +156,11 @@ test("skill uses a root config file and has no stored key or key setter flow", a
 test("skill uses its bundled native streaming stdin entrypoint and does not prescribe MCP", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
   assert.match(skill, /bundled native executable/i);
+  assert.match(skill, /\$HOME\/Pictures\/niucodes-image-gen/i);
+  assert.match(skill, /\$env:USERPROFILE\\Pictures\\niucodes-image-gen/i);
+  assert.match(skill, /Never default to the current workspace, a repository, the skill directory, or a temporary directory/i);
   assert.match(skill, /run --request-stdin/i);
-  assert.match(skill, /HTTP SSE image stream/i);
+  assert.match(skill, /SSE image stream/i);
   assert.match(skill, /partial_images: 0/i);
   assert.match(skill, /Never first create a request file, a temporary shell script, or a PowerShell script/i);
   assert.match(skill, /quoted here-document/i);
@@ -190,25 +197,6 @@ test("legacy MCP config removal preserves unrelated server configuration", () =>
   const updated = removeLegacyMcpServerConfig(initial);
   assert.match(updated, /\[mcp_servers\.other\]/);
   assert.doesNotMatch(updated, /\[mcp_servers\.niucodes_image_gen\]/);
-});
-
-test("suppresses only the Node 18 buffer.File experimental warning", () => {
-  const warnings = [];
-  const runtime = {
-    emitWarning(...args) {
-      warnings.push(args);
-    },
-  };
-  suppressBufferFileExperimentalWarning(runtime);
-
-  runtime.emitWarning("buffer.File is an experimental feature", "ExperimentalWarning");
-  runtime.emitWarning("another experimental feature", "ExperimentalWarning");
-  runtime.emitWarning("buffer.File is an experimental feature", "Warning");
-
-  assert.deepEqual(warnings, [
-    ["another experimental feature", "ExperimentalWarning"],
-    ["buffer.File is an experimental feature", "Warning"],
-  ]);
 });
 
 test("installer copies the native executable, preserves API config, and removes legacy MCP config", async () => {
@@ -578,6 +566,114 @@ test("an incomplete SSE stream fails once without retrying", async () => {
   });
 });
 
+test("a single completed image returns without waiting for the SSE socket to close", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "completed.png");
+  await mkdir(skillRoot, { recursive: true });
+
+  let clientClosed = false;
+  await withMockServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    res.once("close", () => { clientClosed = true; });
+    res.write(`data: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
+    // Deliberately keep the response open. A completed single-image request
+    // must not wait for a proxy/server-side EOF before saving the result.
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "completed-event-key", baseURL, timeoutMs: 5000 }));
+    const startedAt = Date.now();
+    const result = await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: "finish on completed event",
+      output: outputPath,
+      overwrite: true,
+    }), { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    const elapsedMs = Date.now() - startedAt;
+    const payload = JSON.parse(result.stdout);
+
+    assert.equal(result.code, 0);
+    assert.equal(payload.status, "success");
+    assert.ok(elapsedMs < 2000, `completed event should return promptly, took ${elapsedMs}ms`);
+    assert.equal(await exists(outputPath), true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(clientClosed, true);
+  });
+});
+
+for (const command of ["generate", "edit"]) {
+  test(`${command} saves a completed payload without an SSE delimiter or EOF`, async () => {
+    const tempDir = await createTempDir();
+    const skillRoot = path.join(tempDir, "skill root");
+    const statusPath = path.join(tempDir, "status.json");
+    const outputPath = path.join(tempDir, "output.png");
+    const sourcePath = path.join(tempDir, "source.png");
+    await mkdir(skillRoot, { recursive: true });
+    if (command === "edit") await writePng(sourcePath);
+
+    let clientClosed = false;
+    await withMockServer(async (_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+      res.once("close", () => { clientClosed = true; });
+      // Deliberately omit both LF and the blank SSE event terminator. This is
+      // the proxy behavior that previously caused a full 10-minute timeout.
+      res.write(`data: ${completedPayload(command)}`);
+    }, async (baseURL) => {
+      await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "unterminated-key", baseURL, timeoutMs: 5000 }));
+      const request = {
+        version: 1,
+        command,
+        statusFile: statusPath,
+        prompt: "save immediately after complete JSON",
+        output: outputPath,
+        overwrite: true,
+        ...(command === "edit" ? { image: [sourcePath] } : {}),
+      };
+      const startedAt = Date.now();
+      const result = await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], JSON.stringify(request), {
+        env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+      });
+      const payload = JSON.parse(result.stdout);
+      assert.equal(payload.status, "success");
+      assert.equal(payload.timing_ms.stream_completed_frame_terminated, false);
+      assert.ok(Date.now() - startedAt < 2000);
+      assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(clientClosed, true);
+    });
+  });
+}
+
+test("generate waits for a completed JSON split across transport chunks, then returns before EOF", async () => {
+  const tempDir = await createTempDir();
+  const skillRoot = path.join(tempDir, "skill root");
+  const statusPath = path.join(tempDir, "status.json");
+  const outputPath = path.join(tempDir, "output.png");
+  await mkdir(skillRoot, { recursive: true });
+
+  await withMockServer(async (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+    const payload = `data: ${completedPayload("generate")}`;
+    const splitAt = Math.floor(payload.length / 2);
+    res.write(payload.slice(0, splitAt));
+    setTimeout(() => res.write(payload.slice(splitAt)), 40);
+  }, async (baseURL) => {
+    await writeFile(path.join(skillRoot, "config.json"), JSON.stringify({ apiKey: "split-key", baseURL, timeoutMs: 5000 }));
+    const result = await runWithStdin(process.execPath, [scriptPath, "run", "--request-stdin"], JSON.stringify({
+      version: 1,
+      command: "generate",
+      statusFile: statusPath,
+      prompt: "split completed JSON",
+      output: outputPath,
+      overwrite: true,
+    }), { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    assert.equal(JSON.parse(result.stdout).status, "success");
+    assert.equal((await readFile(outputPath)).toString("base64"), fixturePngBase64);
+  });
+});
+
 test("stream timeout aborts the open connection and writes a final failure", async () => {
   const tempDir = await createTempDir();
   const skillRoot = path.join(tempDir, "skill root");
@@ -702,7 +798,7 @@ test("generate publishes a running then successful atomic status after a delayed
   });
 });
 
-test("edit sends the configured SDK request as multipart", async () => {
+test("edit sends the configured HTTP request as multipart", async () => {
   const tempDir = await createTempDir();
   const configPath = path.join(tempDir, "config.json");
   const imagePath = path.join(tempDir, "source.png");
