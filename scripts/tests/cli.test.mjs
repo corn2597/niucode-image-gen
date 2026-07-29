@@ -16,7 +16,7 @@ import {
   resolveConfigPath,
   resolveInvocation,
 } from "../lib/image-client.mjs";
-import { installSkill, removeLegacyMcpServerConfig } from "../lib/installer.mjs";
+import { installSkill, removeLegacyMcpServerConfig, setInstalledApiKey } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(".");
@@ -188,8 +188,16 @@ test("skill uses its bundled native streaming stdin entrypoint and does not pres
 test("Windows installation entrypoint runs the bundled executable in install mode", async () => {
   const installer = await readFile(path.join(repoRoot, "scripts", "install-windows.cmd"), "utf8");
   assert.match(installer, /niucodes-image-gen-win-x64\.exe/i);
-  assert.match(installer, /"%EXECUTABLE%" install/i);
+  assert.match(installer, /"%EXECUTABLE%" install --prompt-api-key/i);
   assert.match(installer, /Restart Codex Desktop/i);
+});
+
+test("Windows bootstrap is a CMD-only installer that delegates hidden key input to the native binary", async () => {
+  const installer = await readFile(path.join(repoRoot, "install-windows.cmd"), "utf8");
+  assert.match(installer, /certutil\.exe -hashfile/i);
+  assert.match(installer, /tar\.exe -xf/i);
+  assert.match(installer, /--prompt-api-key/i);
+  assert.doesNotMatch(installer, /powershell|\.ps1/i);
 });
 
 test("legacy MCP config removal preserves unrelated server configuration", () => {
@@ -254,6 +262,21 @@ test("Apple Silicon installation resolves the native entrypoint and removes lega
   assert.equal(result.protocol, "stream-stdin-v2");
   assert.equal(await readFile(path.join(installDir, "config.json"), "utf8"), '{"apiKey":"preserved"}');
   assert.doesNotMatch(await readFile(configPath, "utf8"), /\[mcp_servers\.niucodes_image_gen\]/);
+});
+
+test("native installer writes a prompted API key only to the installed config", async () => {
+  const tempDir = await createTempDir();
+  const skillDir = path.join(tempDir, "installed skill");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(path.join(skillDir, "config.json"), JSON.stringify({ apiKey: "", model: "gpt-image-2" }));
+
+  await setInstalledApiKey(skillDir, "test-prompted-key");
+
+  assert.deepEqual(JSON.parse(await readFile(path.join(skillDir, "config.json"), "utf8")), {
+    apiKey: "test-prompted-key",
+    model: "gpt-image-2",
+  });
+  await assert.rejects(() => setInstalledApiKey(skillDir, ""), /API key is required/);
 });
 
 test("generate forwards prompt verbatim and reads the key only from config.json", async () => {

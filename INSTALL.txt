@@ -8,9 +8,9 @@ macOS:
   curl -fL https://gitee.com/niucodes/niucode-image-gen/raw/main/install-macos.command -o install-macos.command
   chmod +x install-macos.command && ./install-macos.command
 
-Windows PowerShell:
-  irm https://gitee.com/niucodes/niucode-image-gen/raw/main/install-windows.ps1 -OutFile install-windows.ps1
-  powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+Windows:
+  Download https://gitee.com/niucodes/niucode-image-gen/raw/main/install-windows.cmd
+  Double-click install-windows.cmd
 
 No Node.js, Python, OpenAI SDK, or administrator permission is required.
 Restart Codex Desktop after installation.

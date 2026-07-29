@@ -17,17 +17,18 @@ test("macOS Gitee bootstrap installer downloads, verifies, installs, and writes 
   assert.doesNotMatch(installer, /images\/(generations|edits)/);
 });
 
-test("Windows Gitee bootstrap installer keeps the key local and verifies the package", async () => {
-  const installer = await readFile(path.join(repoRoot, "install-windows.ps1"), "utf8");
-  assert.match(installer, /api\/v5\/repos\/\$repository\/releases\/latest/);
-  assert.ok(installer.includes("FromBase64String('6K+36L6T5YWlIG5pdWNvZGVz55qEYXBpIGtlee+8jGFwaSBrZXnmn6Xmib7lnLDlnYDvvJogd29ya3NwYWNlLmNsYXVkZWNvZGVzLm9yZ++8jCDngrnlh7vlt6bkvqdBUEnlr4bpkqXlpI3liLbvvJo=')"));
-  assert.match(installer, /Read-Host \$apiKeyPrompt -AsSecureString/);
+test("Windows CMD bootstrap installer verifies and installs the current Gitee package", async () => {
+  const installer = await readFile(path.join(repoRoot, "install-windows.cmd"), "utf8");
+  assert.match(installer, /release-version\.txt/);
+  assert.match(installer, /curl\.exe --fail --location/);
+  assert.match(installer, /certutil\.exe -hashfile/);
+  assert.match(installer, /tar\.exe -xf/);
+  assert.match(installer, /--prompt-api-key/);
   assert.doesNotMatch(installer, /[^\x00-\x7F]/);
-  assert.match(installer, /Get-FileHash -Algorithm SHA256/);
-  assert.match(installer, /Expand-Archive/);
-  assert.doesNotMatch(installer, /\[regex\]::/i);
-  assert.match(installer, /install --install-dir/);
-  assert.match(installer, /ConvertTo-Json -Depth 20/);
-  assert.match(installer, /Remove-Variable -Name apiKey/);
+  assert.doesNotMatch(installer, /powershell|\.ps1/i);
   assert.doesNotMatch(installer, /images\/(generations|edits)/);
+
+  const instructions = await readFile(path.join(repoRoot, "INSTALL.txt"), "utf8");
+  assert.match(instructions, /Double-click install-windows\.cmd/);
+  assert.doesNotMatch(instructions, /Windows PowerShell|install-windows\.ps1/i);
 });

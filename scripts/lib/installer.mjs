@@ -75,6 +75,59 @@ async function copyRuntimePackage(packageRoot, installDir) {
   }
 }
 
+export async function setInstalledApiKey(installDir, apiKey) {
+  if (!apiKey) throw new Error("An API key is required.");
+  const configPath = path.join(installDir, "config.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.apiKey = apiKey;
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+}
+
+function promptForApiKey() {
+  if (!process.stdin.isTTY || !process.stdin.setRawMode) {
+    throw new Error("API key input requires an interactive terminal.");
+  }
+
+  return new Promise((resolve, reject) => {
+    let value = "";
+    const input = process.stdin;
+    const cleanup = () => {
+      input.off("data", onData);
+      input.setRawMode(false);
+      input.pause();
+    };
+    const finish = () => {
+      cleanup();
+      process.stdout.write("\n");
+      if (!value) reject(new Error("An API key is required."));
+      else resolve(value);
+    };
+    const onData = (chunk) => {
+      for (const byte of Buffer.from(chunk)) {
+        if (byte === 3) {
+          cleanup();
+          reject(new Error("API key input cancelled."));
+          return;
+        }
+        if (byte === 13 || byte === 10) {
+          finish();
+          return;
+        }
+        if (byte === 8 || byte === 127) {
+          value = value.slice(0, -1);
+          continue;
+        }
+        if (byte >= 32) value += String.fromCharCode(byte);
+      }
+    };
+
+    process.stdout.write("请输入 niucodes的api key，api key查找地址： workspace.claudecodes.org， 点击左侧API密钥复制：");
+    input.setRawMode(true);
+    input.resume();
+    input.on("data", onData);
+  });
+}
+
 async function removeLegacyRunners(installDir) {
   // Installed skills are native-only. Remove the entire legacy directory so a
   // previous PowerShell or shell runner cannot survive an in-place upgrade.
@@ -129,7 +182,11 @@ function readFlag(argv, flag) {
 export async function runInstaller(argv) {
   const installDir = readFlag(argv, "--install-dir");
   const configPath = readFlag(argv, "--config-path");
-  const unsupported = argv.filter((value) => value.startsWith("--") && !["--install-dir", "--config-path"].includes(value));
+  const promptApiKey = argv.includes("--prompt-api-key");
+  const unsupported = argv.filter((value) => value.startsWith("--") && !["--install-dir", "--config-path", "--prompt-api-key"].includes(value));
   if (unsupported.length > 0) throw new Error(`Unsupported install option: ${unsupported[0]}`);
-  return installSkill({ installDir, configPath });
+  const apiKey = promptApiKey ? await promptForApiKey() : undefined;
+  const result = await installSkill({ installDir, configPath });
+  if (apiKey !== undefined) await setInstalledApiKey(result.skill_dir, apiKey);
+  return { ...result, api_key_configured: apiKey !== undefined };
 }

@@ -10,7 +10,7 @@ if not exist "%EXECUTABLE%" (
   exit /b 1
 )
 
-"%EXECUTABLE%" install
+"%EXECUTABLE%" install --prompt-api-key
 if errorlevel 1 (
   echo Installation failed.
   pause
