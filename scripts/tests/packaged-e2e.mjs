@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -86,16 +86,19 @@ function readResult(result) {
 }
 
 const requestedPackageRoot = packageRootArg(process.argv.slice(2));
-const executable = executableFor(requestedPackageRoot);
+const sourceExecutable = executableFor(requestedPackageRoot);
 // Cross-architecture acceptance supplies an executable override. Its adjacent
 // config.json belongs to that package, not to the host-platform package root.
-const packageRoot = process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE
-  ? path.resolve(path.dirname(executable), "..")
+const sourcePackageRoot = process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE
+  ? path.resolve(path.dirname(sourceExecutable), "..")
   : requestedPackageRoot;
-if (!(await exists(executable))) throw new Error(`Packaged executable was not found: ${executable}`);
-assert.deepEqual(await findPowerShellScripts(packageRoot), [], "Release package must not contain a PowerShell runner.");
+if (!(await exists(sourceExecutable))) throw new Error(`Packaged executable was not found: ${sourceExecutable}`);
+assert.deepEqual(await findPowerShellScripts(sourcePackageRoot), [], "Release package must not contain a PowerShell runner.");
 
 const root = await mkdtemp(path.join(os.tmpdir(), "niucodes imagegen packaged v2 中文 "));
+const packageRoot = path.join(root, path.basename(sourcePackageRoot));
+await cp(sourcePackageRoot, packageRoot, { recursive: true });
+const executable = path.join(packageRoot, "bin", path.basename(sourceExecutable));
 const sourceA = path.join(root, "源图 A.png");
 const sourceB = path.join(root, "源图 B.png");
 await writeFile(sourceA, Buffer.from(fixturePngBase64, "base64"));

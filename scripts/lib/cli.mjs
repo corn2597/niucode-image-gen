@@ -408,6 +408,42 @@ function requestFailurePayload(command, error, startedAt, startedAtPerformance, 
   return payload;
 }
 
+async function prepareOutputTargets(invocation, cwd) {
+  const candidates = invocation.explicitOutput
+    ? [invocation.output]
+    : invocation.outputCandidates;
+  let lastError;
+
+  for (const candidate of candidates) {
+    try {
+      const targets = await resolveOutputTargets({
+        command: invocation.command,
+        cwd,
+        model: invocation.model,
+        output: candidate,
+        outputFormat: invocation.outputFormat,
+        overwrite: invocation.overwrite,
+        count: invocation.n,
+        outputIsDirectory: !invocation.explicitOutput,
+      });
+      await assertOutputTargetsWritable(targets);
+      invocation.output = candidate;
+      invocation.outputIsDirectory = !invocation.explicitOutput;
+      return targets;
+    } catch (error) {
+      lastError = error;
+      if (invocation.explicitOutput) throw error;
+    }
+  }
+
+  const error = new Error(
+    `No default image output directory is writable. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+  error.code = "output_permission_denied";
+  error.phase = "initialization";
+  throw error;
+}
+
 async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
   const startedAt = new Date().toISOString();
   const startedAtPerformance = performance.now();
@@ -425,7 +461,7 @@ async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
     }
     const request = toRequestObject(rawRequest, requestSource);
     command = request.command;
-    const payload = await executeImageCommand(command, request.options, { cwd });
+    const payload = await executeImageCommand(command, request.options, { cwd, runId });
     await writeStdout(`${JSON.stringify(payload)}\n`);
     return 0;
   } catch (error) {
@@ -440,7 +476,7 @@ async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
   }
 }
 
-export async function executeImageCommand(command, options, { cwd = process.cwd() } = {}) {
+export async function executeImageCommand(command, options, { cwd = process.cwd(), runId = randomUUID() } = {}) {
   const cliStartedAt = performance.now();
   const startedAt = new Date().toISOString();
   if (!["generate", "edit"].includes(command)) {
@@ -453,7 +489,6 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
   let invocation;
   let requestStarted = false;
   const clientRequestId = randomUUID();
-  const runId = randomUUID();
   let phase = "initialization";
 
   try {
@@ -463,17 +498,7 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     invocation.clientRequestId = clientRequestId;
     const resolveDurationMs = Math.round(performance.now() - resolveStartedAt);
     const outputStartedAt = performance.now();
-    const outputTargets = await resolveOutputTargets({
-      command: invocation.command,
-      cwd,
-      model: invocation.model,
-      output: invocation.output,
-      outputFormat: invocation.outputFormat,
-      overwrite: invocation.overwrite,
-      count: invocation.n,
-      outputIsDirectory: invocation.outputIsDirectory,
-    });
-    await assertOutputTargetsWritable(outputTargets);
+    const outputTargets = await prepareOutputTargets(invocation, cwd);
     const outputPrepareMs = Math.round(performance.now() - outputStartedAt);
     requestStarted = true;
     phase = "upload_or_delivery_unknown";
@@ -538,7 +563,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       stage: failurePhase,
       error: {
         ...normalizedError(error, requestStarted ? failurePhase : "initialization_failed"),
-        code: requestStarted && isRequestDeliveryUnknown(error)
+        code: typeof error?.code === "string"
+          ? error.code
+          : requestStarted && isRequestDeliveryUnknown(error)
           ? "upload_or_delivery_unknown"
           : failurePhase === "save"
             ? "save_failed"

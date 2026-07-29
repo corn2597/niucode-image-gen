@@ -1,4 +1,4 @@
-72938523aafb0948887a4233fa669b0c6aab971dd271bf165914a846c976ed50  niucodes-image-gen-v1.5.0.zip
-bafea8b2d165c70e209a78b6901ecf32e35fd56a9b2fc5f771b3253f7957f7bb  niucodes-image-gen-macos-arm64-v1.5.0.zip
-ea58d087a067ab227dc37f3d08f2507e9f1a45c05a99b425f871a92bcb84b008  niucodes-image-gen-macos-x64-v1.5.0.zip
-ce9b5746121643d24c20e30ae79550762c7998b12554dc137b50bfada4676604  niucodes-image-gen-win-x64-v1.5.0.zip
+31561b0fcc9434e36ccefc663e32d4c3bc32cbdd58312a130016f0ca80281ac8  niucodes-image-gen-v1.5.1.zip
+935241e937e89483755db9efcb75504173de4c4263ccafe2aeb4599d144c2b88  niucodes-image-gen-macos-arm64-v1.5.1.zip
+b9740043783c162898f38e812693b1f7164ced44472f9704e301c33d5e3d85c4  niucodes-image-gen-macos-x64-v1.5.1.zip
+256ad4d163ef917281f0c34de3f484584aa3bf242c4ddd0dd40c151de3b7fa9f  niucodes-image-gen-win-x64-v1.5.1.zip

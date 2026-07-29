@@ -182,6 +182,19 @@ async function taskOutputDirectory(cwd, skillRoot) {
   return path.join(resolvedCwd, "image-outputs", "niucodes-image-gen");
 }
 
+async function workspaceOutputDirectory(workspace) {
+  // `workspace` is an explicit request field supplied by Codex. It remains
+  // authoritative even when an integration happens to mount a workspace
+  // under a temporary root. Only an implicit process CWD is filtered above.
+  return path.join(await canonicalPath(path.resolve(workspace)), "image-outputs", "niucodes-image-gen");
+}
+
+function appendUniquePath(paths, candidate, cwd = process.cwd()) {
+  if (!candidate) return;
+  const resolved = path.resolve(cwd, candidate);
+  if (!paths.some((existing) => path.resolve(existing) === resolved)) paths.push(resolved);
+}
+
 async function readConfigFile(configPath, cwd) {
   const resolvedPath = resolveConfigPath(configPath, cwd);
   try {
@@ -466,10 +479,15 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   }
   const configuredOutput = parseString(config.defaultOutputDir, undefined);
   const skillRoot = resolveSkillRoot();
-  const defaultOutput = workspace
-    ? path.join(path.resolve(workspace), "image-outputs", "niucodes-image-gen")
-    : await taskOutputDirectory(cwd, skillRoot) || configuredOutput || defaultOutputDirectory();
   const explicitOutput = parseString(merged.output, undefined);
+  const outputCandidates = [];
+  if (!explicitOutput) {
+    if (workspace) appendUniquePath(outputCandidates, await workspaceOutputDirectory(workspace), cwd);
+    appendUniquePath(outputCandidates, await taskOutputDirectory(cwd, skillRoot), cwd);
+    appendUniquePath(outputCandidates, configuredOutput, cwd);
+    appendUniquePath(outputCandidates, defaultOutputDirectory(), cwd);
+  }
+  const defaultOutput = outputCandidates[0] ?? defaultOutputDirectory();
   const invocation = {
     command,
     cwd,
@@ -482,6 +500,8 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     prompt: parsePrompt(merged.prompt),
     output: explicitOutput ?? defaultOutput,
     outputIsDirectory: explicitOutput === undefined,
+    outputCandidates: explicitOutput ? [path.resolve(cwd, explicitOutput)] : outputCandidates,
+    explicitOutput: explicitOutput !== undefined,
     outputFormat: validateChoice(parseString(merged.outputFormat, "png"), "outputFormat", ["png", "jpeg", "webp"]),
     quality: validateChoice(parseString(merged.quality, "auto"), "quality", ["auto", "low", "medium", "high"]),
     size: parseString(merged.size, defaultSize),

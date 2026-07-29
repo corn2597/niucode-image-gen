@@ -228,6 +228,50 @@ test("system temp working directory falls back to configured persistent output",
   assert.equal(DEFAULT_TIMEOUT_MS, 600000);
 });
 
+test("unwritable implicit workspace candidate falls through to the configured persistent output", async () => {
+  const root = await tempDir();
+  const configPath = path.join(root, "config.json");
+  const workspaceFile = path.join(root, "not-a-workspace-file");
+  const persistent = path.join(root, "persistent-output");
+  await writeFile(workspaceFile, "not a directory");
+  await writeFile(configPath, JSON.stringify({ apiKey: "test-key", defaultOutputDir: persistent }));
+  const invocation = await resolveInvocation("generate", {
+    config: configPath,
+    prompt: "test",
+    image: [],
+    workspace: workspaceFile,
+  }, { cwd: path.join(os.tmpdir(), "niucodes-image-gen-non-workspace") });
+  assert.match(invocation.output, /not-a-workspace-file[\\/]image-outputs[\\/]niucodes-image-gen$/);
+  assert.equal(invocation.outputCandidates.length, 3);
+  assert.equal(invocation.outputCandidates[1], persistent);
+  assert.equal(invocation.outputCandidates[2], defaultOutputDirectory());
+});
+
+test("native request uses the next implicit output directory when workspace output is unavailable", async () => {
+  const root = await tempDir();
+  const workspaceFile = path.join(root, "workspace-is-a-file");
+  const persistent = path.join(root, "persistent-output");
+  const taskCwd = path.join(os.tmpdir(), "niucodes-image-gen-non-workspace");
+  await writeFile(workspaceFile, "not a directory");
+  await mkdir(taskCwd, { recursive: true });
+  await withMockImagesApi((_request, response) => completed(response, "generate"), async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { defaultOutputDir: persistent });
+    const result = await runWithStdin({
+      version: 2,
+      command: "generate",
+      workspace: workspaceFile,
+      prompt: "fallback output",
+    }, {
+      cwd: taskCwd,
+      env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot },
+    });
+    const payload = parseOneJson(result);
+    assert.equal(payload.status, "success");
+    assert.ok(payload.saved[0].absolute_path.startsWith(`${persistent}${path.sep}`));
+  });
+});
+
 test("macOS /private/tmp alias is never treated as a task workspace", async () => {
   const root = await tempDir();
   const configPath = path.join(root, "config.json");
