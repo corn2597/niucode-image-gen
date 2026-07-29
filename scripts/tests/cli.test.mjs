@@ -9,7 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { DEFAULT_TIMEOUT_MS, defaultOutputDirectory, resolveInvocation } from "../lib/image-client.mjs";
-import { installSkill } from "../lib/installer.mjs";
+import { installSkill, selectPlatformBinary } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
@@ -302,7 +302,15 @@ test("missing workspace uses persistent application data, never a system temp di
 
 test("installer migrates only the historical 570-second default to ten minutes", async () => {
   const root = await tempDir();
+  const packageRoot = path.join(root, "native package");
   const installDir = path.join(root, "installed skill");
+  const packageConfig = path.join(packageRoot, "config.json");
+  const packageExecutable = selectPlatformBinary({ skillRoot: packageRoot });
+  await mkdir(path.dirname(packageExecutable), { recursive: true });
+  await writeFile(packageConfig, JSON.stringify({ apiKey: "", timeoutMs: 600000, defaultOutputDir: "" }));
+  // npm test intentionally runs before binary packaging in CI. Keep this
+  // installer unit test self-contained rather than depending on ignored bin/.
+  await writeFile(packageExecutable, "test native executable");
   await mkdir(installDir, { recursive: true });
   await writeFile(path.join(installDir, "config.json"), JSON.stringify({
     apiKey: "preserved",
@@ -310,7 +318,7 @@ test("installer migrates only the historical 570-second default to ten minutes",
     defaultOutputDir: path.join(root, "Pictures", "niucodes-image-gen"),
   }));
   await installSkill({
-    packageRoot: repoRoot,
+    packageRoot,
     installDir,
     configPath: path.join(root, "config.toml"),
     home: root,
