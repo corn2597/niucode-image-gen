@@ -25,7 +25,7 @@ case "$(uname -m)" in
   *) fail "Unsupported macOS architecture: $(uname -m)." ;;
 esac
 
-read -r -s -p "OpenAI Images API key: " API_KEY
+read -r -s -p "请输入 niucodes的api key，api key查找地址： workspace.claudecodes.org， 点击左侧API密钥复制：" API_KEY
 printf '\n'
 [[ -n "$API_KEY" ]] || fail "An API key is required."
 
