@@ -314,5 +314,5 @@ test("installer migrates only the historical 570-second default to ten minutes",
   const config = JSON.parse(await readFile(path.join(installDir, "config.json"), "utf8"));
   assert.equal(config.apiKey, "preserved");
   assert.equal(config.timeoutMs, 600000);
-  assert.equal(config.defaultOutputDir, path.join(root, "Library", "Application Support", "niucodes-image-gen", "outputs"));
+  assert.equal(config.defaultOutputDir, defaultOutputDirectory({ home: root, platform: process.platform }));
 });
