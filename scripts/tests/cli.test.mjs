@@ -272,7 +272,7 @@ test("native request uses the next implicit output directory when workspace outp
   });
 });
 
-test("macOS /private/tmp alias is never treated as a task workspace", async () => {
+test("macOS /private/tmp alias is never treated as a task workspace", { skip: process.platform !== "darwin" }, async () => {
   const root = await tempDir();
   const configPath = path.join(root, "config.json");
   const persistent = path.join(root, "persistent-output");
