@@ -1,9 +1,10 @@
 import { readFile, realpath, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { Agent, File, FormData, ProxyAgent, fetch } from "undici";
+import { Agent, ProxyAgent, fetch } from "undici";
 
 export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
@@ -238,10 +239,36 @@ function detectMimeType(filePath) {
   }
 }
 
-async function toUploadable(filePath, inputState) {
+async function readUploadable(filePath, inputState) {
   const resolved = await assertLocalFile(filePath, inputState);
-  const bytes = await readFile(resolved);
-  return new File([bytes], path.basename(resolved), { type: detectMimeType(resolved) });
+  return {
+    bytes: await readFile(resolved),
+    filename: path.basename(resolved),
+    mimeType: detectMimeType(resolved),
+  };
+}
+
+function escapeMultipartHeaderValue(value) {
+  // A local filename must not be able to inject another multipart header.
+  return String(value).replace(/[\r\n"]/g, "_");
+}
+
+function multipartTextPart(boundary, key, value) {
+  return Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartHeaderValue(key)}"\r\n\r\n${String(value)}\r\n`,
+    "utf8",
+  );
+}
+
+function multipartFilePart(boundary, key, file) {
+  return [
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartHeaderValue(key)}"; filename="${escapeMultipartHeaderValue(file.filename)}"\r\nContent-Type: ${file.mimeType}\r\n\r\n`,
+      "utf8",
+    ),
+    file.bytes,
+    Buffer.from("\r\n", "utf8"),
+  ];
 }
 
 function trimTrailingSlash(value) {
@@ -493,6 +520,10 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     if (workspace) appendUniquePath(outputCandidates, await workspaceOutputDirectory(workspace), cwd);
     appendUniquePath(outputCandidates, await taskOutputDirectory(cwd, skillRoot), cwd);
     appendUniquePath(outputCandidates, configuredOutput, cwd);
+    // Prefer a visible, user-owned directory when Codex has no workspace.
+    // Controlled Folder Access can deny Pictures on Windows, so the durable
+    // application-data directory remains the final non-temp fallback.
+    appendUniquePath(outputCandidates, legacyPicturesOutputDirectory(), cwd);
     appendUniquePath(outputCandidates, defaultOutputDirectory(), cwd);
   }
   const defaultOutput = outputCandidates[0] ?? defaultOutputDirectory();
@@ -533,7 +564,10 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   if (!invocation.apiKey) throw new Error("Missing apiKey in config.json.");
   const outputPath = path.resolve(cwd, invocation.output);
   if (isPathWithin(resolveSkillRoot(), outputPath)) {
-    throw new Error("Output must be outside the skill directory. Pass --output <directory> in a user-owned location.");
+    const error = new Error("Output must be outside the skill directory. Pass an output path in a user-owned location.");
+    error.code = "output_permission_denied";
+    error.phase = "output";
+    throw error;
   }
 
   if (invocation.outputCompression !== undefined && invocation.outputFormat === "png") {
@@ -553,10 +587,6 @@ function definedJsonPayload(payload) {
   return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
 }
 
-function appendFormValue(form, key, value) {
-  if (value !== undefined && value !== null) form.append(key, String(value));
-}
-
 async function createRequestBody(invocation) {
   const payload = {
     ...applySharedPayload(invocation),
@@ -570,15 +600,25 @@ async function createRequestBody(invocation) {
   }
 
   const preparationStartedAt = performance.now();
-  const form = new FormData();
-  for (const [key, value] of Object.entries(payload)) appendFormValue(form, key, value);
+  const boundary = `----niucodes-image-gen-${randomBytes(18).toString("hex")}`;
+  const chunks = [];
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== undefined && value !== null) chunks.push(multipartTextPart(boundary, key, value));
+  }
   const inputState = { totalBytes: 0 };
   for (const filePath of invocation.images) {
-    form.append("image", await toUploadable(path.resolve(invocation.cwd, filePath), inputState));
+    chunks.push(...multipartFilePart(boundary, "image", await readUploadable(path.resolve(invocation.cwd, filePath), inputState)));
   }
-  if (invocation.mask) form.append("mask", await toUploadable(path.resolve(invocation.cwd, invocation.mask), inputState));
-  if (invocation.inputFidelity) appendFormValue(form, "input_fidelity", invocation.inputFidelity);
-  return { body: form, inputPrepareMs: Math.round(performance.now() - preparationStartedAt) };
+  if (invocation.mask) {
+    chunks.push(...multipartFilePart(boundary, "mask", await readUploadable(path.resolve(invocation.cwd, invocation.mask), inputState)));
+  }
+  if (invocation.inputFidelity) chunks.push(multipartTextPart(boundary, "input_fidelity", invocation.inputFidelity));
+  chunks.push(Buffer.from(`--${boundary}--\r\n`, "utf8"));
+  return {
+    body: Buffer.concat(chunks),
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    inputPrepareMs: Math.round(performance.now() - preparationStartedAt),
+  };
 }
 
 function requestIdFromResponse(response) {
@@ -618,7 +658,7 @@ async function createTransport(proxyUrl) {
 
 export async function createImageRequest(invocation, { clientRequestId } = {}) {
   const transport = await createTransport(invocation.proxyUrl);
-  const lifecycle = createRequestLifecycle(invocation.timeoutMs);
+  let lifecycle;
   try {
     let requestBody;
     try {
@@ -628,6 +668,10 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
       throw error;
     }
     const { body, contentType, inputPrepareMs = 0 } = requestBody;
+    // Input validation and local file preparation do not consume the actual
+    // configured API deadline. Once fetch begins, the request gets its full
+    // ten-minute budget.
+    lifecycle = createRequestLifecycle(invocation.timeoutMs);
     lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
     let response;
@@ -686,7 +730,7 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
     }
     throw error;
   } finally {
-    lifecycle.dispose();
+    lifecycle?.dispose();
     await transport.close();
   }
 }

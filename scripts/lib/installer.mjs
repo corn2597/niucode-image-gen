@@ -1,4 +1,5 @@
 import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -73,7 +74,7 @@ async function copyIfPresent(source, target) {
   }
 }
 
-async function copyRuntimePackage(packageRoot, installDir) {
+async function copyRuntimePackage(packageRoot, installDir, existingConfigPath) {
   const staticFiles = [
     "SKILL.md",
     path.join("agents", "openai.yaml"),
@@ -88,8 +89,35 @@ async function copyRuntimePackage(packageRoot, installDir) {
   await copyIfPresent(path.join(packageRoot, "bin"), path.join(installDir, "bin"));
   const sourceConfig = path.join(packageRoot, "config.json");
   const targetConfig = path.join(installDir, "config.json");
-  if (!(await exists(targetConfig))) {
-    await copyIfPresent(sourceConfig, targetConfig);
+  await copyIfPresent(sourceConfig, targetConfig);
+  // Preserve the existing local credential/configuration, never the release
+  // template. The release package itself contains no usable API key.
+  if (existingConfigPath) await copyIfPresent(existingConfigPath, targetConfig);
+}
+
+async function replaceRuntimePackage(packageRoot, installDir) {
+  const existingConfigPath = path.join(installDir, "config.json");
+  const parentDir = path.dirname(installDir);
+  const baseName = path.basename(installDir);
+  const stagingDir = path.join(parentDir, `.${baseName}.staging-${process.pid}-${randomUUID()}`);
+  const backupDir = path.join(parentDir, `.${baseName}.backup-${process.pid}-${randomUUID()}`);
+  let previousMoved = false;
+
+  await mkdir(parentDir, { recursive: true });
+  try {
+    await copyRuntimePackage(packageRoot, stagingDir, existingConfigPath);
+    if (await exists(installDir)) {
+      await rename(installDir, backupDir);
+      previousMoved = true;
+    }
+    await rename(stagingDir, installDir);
+    if (previousMoved) await rm(backupDir, { recursive: true, force: true });
+  } catch (error) {
+    await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    if (previousMoved && !(await exists(installDir)) && await exists(backupDir)) {
+      await rename(backupDir, installDir).catch(() => undefined);
+    }
+    throw error;
   }
 }
 
@@ -98,7 +126,9 @@ export async function setInstalledApiKey(installDir, apiKey) {
   const configPath = path.join(installDir, "config.json");
   const config = JSON.parse(await readFile(configPath, "utf8"));
   config.apiKey = apiKey;
-  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const temporaryPath = `${configPath}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, configPath);
 }
 
 async function ensureOutputConfig(installDir, { home, platform }) {
@@ -112,10 +142,8 @@ async function ensureOutputConfig(installDir, { home, platform }) {
   const configuredOutputDir = typeof config.defaultOutputDir === "string" && config.defaultOutputDir.trim()
     ? path.resolve(config.defaultOutputDir)
     : undefined;
-  const oldDefaultOutputDir = path.resolve(legacyPicturesOutputDirectory({ home, platform }));
-  const outputDir = configuredOutputDir && configuredOutputDir !== oldDefaultOutputDir
-    ? configuredOutputDir
-    : path.resolve(defaultOutputDirectory({ home, platform }));
+  const outputDir = configuredOutputDir
+    ?? path.resolve(legacyPicturesOutputDirectory({ home, platform }));
   config.defaultOutputDir = outputDir;
   // v1.4.x used 570 seconds internally to reserve a local save window. The
   // native v2 runner saves after the completed event, so migrate only that old
@@ -220,7 +248,7 @@ export async function installSkill({
   const sourceRoot = path.resolve(packageRoot);
   const targetRoot = path.resolve(installDir);
   if (sourceRoot !== targetRoot) {
-    await copyRuntimePackage(sourceRoot, targetRoot);
+    await replaceRuntimePackage(sourceRoot, targetRoot);
   }
   await removeLegacyRunners(targetRoot);
   const executable = selectPlatformBinary({ platform, arch, skillRoot: targetRoot });
@@ -229,6 +257,10 @@ export async function installSkill({
   }
   const defaultOutputDir = await ensureOutputConfig(targetRoot, { home, platform });
   const sandboxConfig = await updateCodexSandboxConfig(path.resolve(configPath), defaultOutputDir);
+  const fallbackSandboxConfig = await updateCodexSandboxConfig(
+    path.resolve(configPath),
+    defaultOutputDirectory({ home, platform }),
+  );
   return {
     status: "success",
     skill_dir: targetRoot,
@@ -236,7 +268,7 @@ export async function installSkill({
     executable,
     protocol: "stream-stdin-v2-single-frame",
     removed_legacy_mcp_config: sandboxConfig.removedLegacyMcpConfig,
-    sandbox_config_updated: sandboxConfig.changed,
+    sandbox_config_updated: sandboxConfig.changed || fallbackSandboxConfig.changed,
     config_backup_path: sandboxConfig.backupPath,
     default_output_dir: defaultOutputDir,
     restart_required: true,

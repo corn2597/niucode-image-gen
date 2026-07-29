@@ -442,7 +442,7 @@ async function prepareOutputTargets(invocation, cwd) {
     `No default image output directory is writable. Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
   );
   error.code = "output_permission_denied";
-  error.phase = "initialization";
+  error.phase = "output";
   throw error;
 }
 
@@ -491,7 +491,7 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
   let invocation;
   let requestStarted = false;
   const clientRequestId = randomUUID();
-  let phase = "initialization";
+  let phase = "input";
 
   try {
     const verboseResponse = false;
@@ -499,6 +499,7 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     invocation = await resolveInvocation(command, options, { cwd });
     invocation.clientRequestId = clientRequestId;
     const resolveDurationMs = Math.round(performance.now() - resolveStartedAt);
+    phase = "output";
     const outputStartedAt = performance.now();
     const outputTargets = await prepareOutputTargets(invocation, cwd);
     const outputPrepareMs = Math.round(performance.now() - outputStartedAt);
@@ -572,8 +573,10 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
           ? "upload_or_delivery_unknown"
           : failurePhase === "save"
             ? "save_failed"
-            : failurePhase === "input"
+          : failurePhase === "input"
               ? "input_invalid"
+              : failurePhase === "output"
+                ? "output_permission_denied"
               : failurePhase === "response_incomplete"
                 ? "response_incomplete"
                 : "initialization_failed",

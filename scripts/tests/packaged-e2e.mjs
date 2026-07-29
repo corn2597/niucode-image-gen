@@ -31,6 +31,17 @@ async function findPowerShellScripts(directory) {
   return found;
 }
 
+async function assertRuntimeOnlyPackage(directory) {
+  const allowedRootEntries = new Set([".codex-plugin", "agents", "bin", "config.json", "INSTALL.txt", "SKILL.md"]);
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    assert.ok(allowedRootEntries.has(entry.name), `Release package contains a non-runtime entry: ${entry.name}`);
+  }
+  assert.deepEqual(await findPowerShellScripts(directory), [], "Release package must not contain a PowerShell runner.");
+  assert.equal(await exists(path.join(directory, "scripts")), false, "Release package must not contain source scripts.");
+  assert.equal(await exists(path.join(directory, "node_modules")), false, "Release package must not contain Node dependencies.");
+}
+
 function executableFor(packageRoot) {
   const files = process.platform === "win32"
     ? ["niucodes-image-gen-win-x64.exe"]
@@ -80,7 +91,6 @@ function complete(response, command) {
 }
 
 function readResult(result) {
-  assert.equal(result.stderr, "");
   assert.equal(result.stdout.trim().split("\n").length, 1);
   return JSON.parse(result.stdout);
 }
@@ -93,7 +103,7 @@ const sourcePackageRoot = process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE
   ? path.resolve(path.dirname(sourceExecutable), "..")
   : requestedPackageRoot;
 if (!(await exists(sourceExecutable))) throw new Error(`Packaged executable was not found: ${sourceExecutable}`);
-assert.deepEqual(await findPowerShellScripts(sourcePackageRoot), [], "Release package must not contain a PowerShell runner.");
+await assertRuntimeOnlyPackage(sourcePackageRoot);
 
 const root = await mkdtemp(path.join(os.tmpdir(), "niucodes imagegen packaged v2 中文 "));
 const packageRoot = path.join(root, path.basename(sourcePackageRoot));

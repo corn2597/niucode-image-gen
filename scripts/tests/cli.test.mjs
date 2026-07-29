@@ -8,7 +8,7 @@ import process from "node:process";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { DEFAULT_TIMEOUT_MS, defaultOutputDirectory, resolveInvocation } from "../lib/image-client.mjs";
+import { DEFAULT_TIMEOUT_MS, defaultOutputDirectory, legacyPicturesOutputDirectory, resolveInvocation } from "../lib/image-client.mjs";
 import { installSkill, selectPlatformBinary } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -129,7 +129,10 @@ test("v2 edit uploads multiple absolute input images without PowerShell argument
     assert.equal(request.url, "/v1/images/edits");
     assert.match(request.headers["content-type"], /^multipart\/form-data/);
     assert.match(body.toString("utf8"), /保持构图，将围巾改为深蓝色/);
-    assert.equal((body.toString("latin1").match(/name="image"/g) ?? []).length, 2);
+    const multipart = body.toString("latin1");
+    assert.equal((multipart.match(/name="image"/g) ?? []).length, 2);
+    assert.match(multipart, /name="partial_images"\r\n\r\n0/);
+    assert.match(multipart, /name="output_format"\r\n\r\npng/);
     completed(response, "edit");
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
@@ -141,6 +144,61 @@ test("v2 edit uploads multiple absolute input images without PowerShell argument
     assert.equal(payload.status, "success");
     assert.equal(payload.saved.length, 1);
   });
+});
+
+test("v2 edit accepts eight input images in one bounded stdin request", async () => {
+  const root = await tempDir();
+  const images = await Promise.all(Array.from({ length: 8 }, async (_, index) => {
+    const imagePath = path.join(root, `多图输入 ${index + 1}.png`);
+    await writeFile(imagePath, Buffer.from(fixturePngBase64, "base64"));
+    return imagePath;
+  }));
+  await withMockImagesApi((request, response, body) => {
+    assert.equal(request.url, "/v1/images/edits");
+    assert.equal((body.toString("latin1").match(/name="image"/g) ?? []).length, 8);
+    completed(response, "edit");
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL);
+    const result = await runWithStdin({
+      version: 2,
+      command: "edit",
+      workspace: path.join(root, "workspace"),
+      prompt: "将八张参考图统一为同一产品系列",
+      images,
+    }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    assert.equal(parseOneJson(result).status, "success");
+  });
+});
+
+test("invalid edit input is rejected before an API request and remains retry-safe", async () => {
+  const root = await tempDir();
+  let requests = 0;
+  await withMockImagesApi((_request, response) => {
+    requests += 1;
+    completed(response, "edit");
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL);
+    let failure;
+    try {
+      await runWithStdin({
+        version: 2,
+        command: "edit",
+        workspace: path.join(root, "workspace"),
+        prompt: "保留构图",
+        images: [path.join(root, "不存在的图片.png")],
+      }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    const payload = JSON.parse(failure.stdout);
+    assert.equal(payload.phase, "input");
+    assert.equal(payload.error.code, "input_invalid");
+    assert.equal(payload.retry_safe, true);
+  });
+  assert.equal(requests, 0);
 });
 
 test("v2 rejects intermediate-file and endpoint fields before any API request", async () => {
@@ -172,7 +230,8 @@ test("v2 validates an unwritable-like output before attempting the image API", a
   }
   assert.ok(failure);
   const payload = JSON.parse(failure.stdout);
-  assert.equal(payload.phase, "initialization");
+  assert.equal(payload.phase, "output");
+  assert.equal(payload.error.code, "output_permission_denied");
   assert.match(payload.error.message, /outside the skill directory/);
 });
 
@@ -246,9 +305,10 @@ test("unwritable implicit workspace candidate falls through to the configured pe
     workspace: workspaceFile,
   }, { cwd: path.join(os.tmpdir(), "niucodes-image-gen-non-workspace") });
   assert.match(invocation.output, /not-a-workspace-file[\\/]image-outputs[\\/]niucodes-image-gen$/);
-  assert.equal(invocation.outputCandidates.length, 3);
+  assert.equal(invocation.outputCandidates.length, 4);
   assert.equal(invocation.outputCandidates[1], persistent);
-  assert.equal(invocation.outputCandidates[2], defaultOutputDirectory());
+  assert.equal(invocation.outputCandidates[2], legacyPicturesOutputDirectory());
+  assert.equal(invocation.outputCandidates[3], defaultOutputDirectory());
 });
 
 test("native request uses the next implicit output directory when workspace output is unavailable", async () => {
@@ -285,7 +345,15 @@ test("macOS /private/tmp alias is never treated as a task workspace", { skip: pr
   assert.equal(invocation.output, persistent);
 });
 
-test("missing workspace uses persistent application data, never a system temp directory", () => {
+test("missing workspace uses Pictures first and persistent application data as a non-temp fallback", () => {
+  assert.equal(
+    legacyPicturesOutputDirectory({ home: "/Users/example", platform: "darwin" }),
+    "/Users/example/Pictures/niucodes-image-gen",
+  );
+  assert.equal(
+    legacyPicturesOutputDirectory({ home: "C:\\Users\\example", platform: "win32" }),
+    "C:\\Users\\example\\Pictures\\niucodes-image-gen",
+  );
   assert.equal(
     defaultOutputDirectory({ home: "/Users/example", platform: "darwin" }),
     "/Users/example/Library/Application Support/niucodes-image-gen/outputs",
@@ -312,6 +380,8 @@ test("installer migrates only the historical 570-second default to ten minutes",
   // installer unit test self-contained rather than depending on ignored bin/.
   await writeFile(packageExecutable, "test native executable");
   await mkdir(installDir, { recursive: true });
+  await mkdir(path.join(installDir, "scripts"), { recursive: true });
+  await writeFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "legacy");
   await writeFile(path.join(installDir, "config.json"), JSON.stringify({
     apiKey: "preserved",
     timeoutMs: 570000,
@@ -326,5 +396,6 @@ test("installer migrates only the historical 570-second default to ten minutes",
   const config = JSON.parse(await readFile(path.join(installDir, "config.json"), "utf8"));
   assert.equal(config.apiKey, "preserved");
   assert.equal(config.timeoutMs, 600000);
-  assert.equal(config.defaultOutputDir, defaultOutputDirectory({ home: root, platform: process.platform }));
+  assert.equal(config.defaultOutputDir, legacyPicturesOutputDirectory({ home: root, platform: process.platform }));
+  await assert.rejects(readFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "utf8"));
 });

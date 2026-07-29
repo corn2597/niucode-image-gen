@@ -9,32 +9,34 @@ Run exactly one bundled native executable for each request. Do not use MCP, Powe
 
 Use the installed executable from `${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen/bin` on macOS or `$env:USERPROFILE\.codex\skills\niucodes-image-gen\bin` on Windows. Select `niucodes-image-gen-macos-arm64` on Apple Silicon, `niucodes-image-gen-macos-x64` on Intel macOS, or `niucodes-image-gen-win-x64.exe` on Windows.
 
-Build one UTF-8 JSON line with `version: 2`, preserve the user prompt verbatim, and send it to `run --request-stdin`. The line is a single request frame and does not require stdin EOF. Pass an absolute `workspace` whenever the current task has one. Do not include `apiKey`, `config`, `baseUrl`, `stream`, `partialImages`, or `statusFile` in a normal request.
+Build one UTF-8 JSON line with `version: 2`, preserve the user prompt verbatim, and send it to `run --request-stdin`. The line is a single request frame and does not require stdin EOF. When the current task has a workspace, set `workspace` to that task's actual absolute root; never send a sample or placeholder path. Do not include `apiKey`, `config`, `baseUrl`, `stream`, `partialImages`, or `statusFile` in a normal request.
 
 ```json
-{"version":2,"command":"generate","workspace":"/absolute/workspace","prompt":"original user prompt","quality":"low","size":"1024x1024"}
+{"version":2,"command":"generate","prompt":"original user prompt","quality":"low","size":"1024x1024"}
 ```
 
 For `edit`, add `images` as an array of absolute input-image paths and optionally an absolute `mask`. Multiple input images are supported; the request still produces exactly one output image. Do not set `n` other than `1`.
 
-Output location priority is: explicit absolute `output`; `workspace/image-outputs/niucodes-image-gen`; current task working directory `image-outputs/niucodes-image-gen` when it is not a system temporary directory; configured default output; then persistent per-user application data (`~/Library/Application Support/niucodes-image-gen/outputs` on macOS or `%LOCALAPPDATA%\\niucodes-image-gen\\outputs` on Windows). Do not create a system temporary output directory or write images inside the skill directory. The native runner validates output writability before the API request. On failure, return its JSON error and do not retry. The configured request timeout is 10 minutes; do not interrupt a request before that deadline.
+Output location priority is: explicit absolute `output`; `workspace/image-outputs/niucodes-image-gen`; current task working directory `image-outputs/niucodes-image-gen` when it is not a system temporary directory; configured default output; `~/Pictures/niucodes-image-gen` on macOS or `%USERPROFILE%\\Pictures\\niucodes-image-gen` on Windows; then persistent per-user application data (`~/Library/Application Support/niucodes-image-gen/outputs` on macOS or `%LOCALAPPDATA%\\niucodes-image-gen\\outputs` on Windows). Do not create a system temporary output directory or write images inside the skill directory. The native runner validates output writability before the API request. On failure, return its JSON error and do not retry. The configured request timeout is 10 minutes; do not interrupt a request before that deadline.
 
 On macOS, invoke the executable once through a quoted here-document. Use the host-appropriate executable name.
 
 ```sh
 "${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen/bin/niucodes-image-gen-macos-arm64" run --request-stdin <<'NIUCODES_REQUEST'
-{"version":2,"command":"generate","workspace":"/absolute/workspace","prompt":"original user prompt","quality":"low","size":"1024x1024"}
+{"version":2,"command":"generate","prompt":"original user prompt","quality":"low","size":"1024x1024"}
 NIUCODES_REQUEST
 ```
 
-On Windows, use one PowerShell terminal command and pipe the JSON here-string into the executable. Do not pass request fields as PowerShell parameters.
+On Windows, start only the native executable, then send the JSON line through that same terminal session's stdin writer. Do not use a PowerShell here-string, pipeline, or request parameters.
 
 ```powershell
-$request = @'
-{"version":2,"command":"generate","workspace":"C:\\absolute\\workspace","prompt":"original user prompt","quality":"low","size":"1024x1024"}
-'@
-$request | & (Join-Path $env:USERPROFILE ".codex\skills\niucodes-image-gen\bin\niucodes-image-gen-win-x64.exe") run --request-stdin
-exit $LASTEXITCODE
+& (Join-Path $env:USERPROFILE ".codex\skills\niucodes-image-gen\bin\niucodes-image-gen-win-x64.exe") run --request-stdin
+```
+
+Write exactly this UTF-8 line followed by `\n` to the process stdin:
+
+```json
+{"version":2,"command":"generate","prompt":"original user prompt","quality":"low","size":"1024x1024"}
 ```
 
 Keep the same terminal process alive until it exits. When an initial terminal call returns a session id, wait on that exact session; never start a second process or poll a status file. The executable emits one UTF-8 JSON object on stdout and writes operational logs only to stderr.
