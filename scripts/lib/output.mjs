@@ -1,5 +1,6 @@
 import path from "node:path";
-import { access, mkdir, stat, writeFile } from "node:fs/promises";
+import { access, link, mkdir, open, rename, rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 
 function formatTimestamp(date = new Date()) {
@@ -86,17 +87,20 @@ export async function resolveOutputTargets({
   outputFormat,
   overwrite,
   count,
+  outputIsDirectory = false,
 }) {
   const extension = extensionForFormat(outputFormat);
-  const defaultName = `${safeSlug(model)}-${command}-${formatTimestamp()}.${extension}`;
+  // Include entropy in automatically chosen names. Timestamp-only names race
+  // when two Codex tasks finish in the same second.
+  const defaultName = `${safeSlug(model)}-${command}-${formatTimestamp()}-${randomUUID()}.${extension}`;
 
   let baseTarget;
   if (!output) {
-    baseTarget = path.resolve(cwd, "image-outputs", defaultName);
+    throw new Error("Output resolution requires a default output directory.");
   } else {
     const resolved = path.resolve(cwd, output);
-    const resolvedIsDirectory =
-      (await pathExists(resolved)) && (await stat(resolved).then((entry) => entry.isDirectory()).catch(() => false));
+    const resolvedIsDirectory = outputIsDirectory
+      || ((await pathExists(resolved)) && (await stat(resolved).then((entry) => entry.isDirectory()).catch(() => false)));
 
     if (isDirectoryHint(output) || resolvedIsDirectory) {
       baseTarget = path.join(resolved, defaultName);
@@ -123,34 +127,89 @@ export async function resolveOutputTargets({
   return targets;
 }
 
+export async function assertOutputTargetsWritable(targets) {
+  const directories = [...new Set(targets.map((target) => path.dirname(target)))];
+  for (const directory of directories) {
+    await mkdir(directory, { recursive: true });
+    const probePath = path.join(directory, `.niucodes-write-probe-${process.pid}-${randomUUID()}`);
+    let handle;
+    try {
+      handle = await open(probePath, "wx", 0o600);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Output directory is not writable: ${directory} (${detail})`);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await rm(probePath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
 function markdownPath(absolutePath) {
   const normalized = absolutePath.replace(/\\/g, "/");
   return /^[A-Za-z]:\//.test(normalized) ? `/${normalized}` : normalized;
 }
 
-async function saveImageItem(item, outputPath, timeoutMs) {
-  if (item?.b64_json) {
-    const buffer = Buffer.from(item.b64_json, "base64");
-    await writeFile(outputPath, buffer);
-    return outputPath;
+function decodeBase64Image(value) {
+  // Buffer.from silently accepts malformed Base64. Reject it before writing a
+  // file so a successful API event cannot become a corrupt local artifact.
+  if (typeof value !== "string" || value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+    throw new Error("Image API response contained invalid Base64 image data.");
   }
-
-  if (item?.url) {
-    const response = await fetch(item.url, {
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to download image from ${item.url}: HTTP ${response.status}`);
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    await writeFile(outputPath, bytes);
-    return outputPath;
+  const buffer = Buffer.from(value, "base64");
+  if (buffer.length === 0 || buffer.toString("base64") !== value) {
+    throw new Error("Image API response contained invalid Base64 image data.");
   }
-
-  throw new Error("Image API response item did not contain b64_json or url.");
+  const isPng = buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const isJpeg = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  const isWebp = buffer.length >= 12 && buffer.subarray(0, 4).equals(Buffer.from("RIFF")) && buffer.subarray(8, 12).equals(Buffer.from("WEBP"));
+  if (!isPng && !isJpeg && !isWebp) {
+    throw new Error("Image API response did not contain a PNG, JPEG, or WebP image.");
+  }
+  return { buffer, mimeType: isPng ? "image/png" : isJpeg ? "image/jpeg" : "image/webp" };
 }
 
-export async function saveImageItems(apiResponse, outputTargets, timeoutMs) {
+async function saveImageItem(item, outputPath, { overwrite = false } = {}) {
+  if (typeof item?.b64_json !== "string" || item.b64_json.length === 0) {
+    throw new Error("Image API response item did not contain b64_json.");
+  }
+
+  const { buffer, mimeType } = decodeBase64Image(item.b64_json);
+  const temporaryPath = path.join(
+    path.dirname(outputPath),
+    `.${path.basename(outputPath)}.${process.pid}.${randomUUID()}.part`,
+  );
+  try {
+    const handle = await open(temporaryPath, "wx", 0o600);
+    try {
+      await handle.writeFile(buffer);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (overwrite) {
+      await rename(temporaryPath, outputPath);
+    } else {
+      // link() is atomic and fails with EEXIST instead of replacing a file
+      // created by a concurrent invocation after target selection.
+      try {
+        await link(temporaryPath, outputPath);
+      } catch (error) {
+        if (error?.code === "EEXIST") {
+          throw new Error(`Output file already exists: ${outputPath}`);
+        }
+        throw error;
+      }
+      await rm(temporaryPath, { force: true });
+    }
+    return { absolutePath: outputPath, bytes: buffer.length, mimeType };
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function saveImageItems(apiResponse, outputTargets, { overwrite = false } = {}) {
   const data = Array.isArray(apiResponse?.data) ? apiResponse.data : [];
   if (data.length === 0) {
     throw new Error("Image API response did not contain any data items.");
@@ -162,9 +221,11 @@ export async function saveImageItems(apiResponse, outputTargets, timeoutMs) {
 
   const savedPaths = [];
   for (let index = 0; index < data.length; index += 1) {
-    const savedPath = await saveImageItem(data[index], outputTargets[index], timeoutMs);
+    const savedPath = await saveImageItem(data[index], outputTargets[index], { overwrite });
     savedPaths.push({
-      absolutePath: savedPath,
+      absolutePath: savedPath.absolutePath,
+      bytes: savedPath.bytes,
+      mimeType: savedPath.mimeType,
       revisedPrompt: data[index]?.revised_prompt ?? null,
     });
   }
@@ -176,6 +237,8 @@ export function buildRenderables(savedItems, command) {
   return savedItems.map((item, index) => ({
     index,
     absolute_path: item.absolutePath,
+    bytes: item.bytes,
+    mime_type: item.mimeType,
     markdown_path: markdownPath(item.absolutePath),
     markdown: `![${command}-${index + 1}](${markdownPath(item.absolutePath)})`,
     revised_prompt: item.revisedPrompt,

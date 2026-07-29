@@ -12,8 +12,11 @@ async function main() {
       return;
     }
     const exitCode = await runCli(process.argv.slice(2));
-    // Allow stdout to drain before Node exits, including when it is captured by a host tool.
-    process.exitCode = exitCode;
+    // runCli waits for the final stdout write callback. Give a terminal pipe a
+    // brief chance to consume that JSON before force-ending this one-shot CLI;
+    // an upstream proxy or keep-alive socket must not hold it open afterward.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    process.exit(exitCode);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await new Promise((resolve, reject) => {
@@ -22,7 +25,8 @@ async function main() {
         else resolve();
       });
     });
-    process.exitCode = 1;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    process.exit(1);
   }
 }
 

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import process from "node:process";
@@ -15,6 +15,7 @@ import {
 } from "./image-client.mjs";
 import {
   buildRenderables,
+  assertOutputTargetsWritable,
   resolveOutputTargets,
   saveImageItems,
   stableStringify,
@@ -24,51 +25,25 @@ const HELP_TEXT = `niucodes-image-gen
 
 Usage:
   niucodes-image-gen run --request-stdin
-  niucodes-image-gen run --request-file "<absolute-request.json>" (legacy compatibility)
-  niucodes-image-gen generate --prompt "..." [options]
-  niucodes-image-gen edit --image "<path>" --prompt "..." [options]
 
 Commands:
   run         Execute one structured request through the native streaming entrypoint.
-  generate    Call /v1/images/generations as an HTTP SSE stream.
-  edit        Call /v1/images/edits as an HTTP SSE stream.
 
-Common options:
-  --config <path>               JSON config path. Defaults to <skill-dir>/config.json.
-                                apiKey is read only from this config file.
-  --base-url <url>              Image API base URL. Defaults to ${DEFAULT_BASE_URL}.
-  --model <model>               Defaults to gpt-image-2.
-  --output <file-or-dir>        Required. Output file or directory outside the skill directory.
-  --output-format <fmt>         png | jpeg | webp
-  --quality <value>             auto | low | medium | high
-  --size <value>                Supported size. Defaults to ${DEFAULT_GENERATE_SIZE} for generate
-                                and ${DEFAULT_EDIT_SIZE} for edit.
-  --background <value>          auto | opaque | transparent
-  --moderation <value>          auto | low
-  --n <count>                   Number of images to save. Default: 1
-  --overwrite                   Overwrite the first output path if it already exists.
-  --timeout-ms <ms>             End-to-end request timeout in milliseconds. Default: 600000
-  --status-file <path>          Optional JSON lifecycle file. Written atomically after each state change.
-  --verbose-response            Include expanded request/response metadata in the JSON output.
-
-Edit-only options:
-  --image <path>                Repeat to upload multiple local reference images.
-  --mask <path>                 Optional local mask image path.
-  --input-fidelity <value>      low | high. Omit for gpt-image-2.
-
-Display rule:
-  The script prints compact JSON by default. Reuse saved[*].markdown in the final answer so Codex,
-  VS Code surfaces, and similar clients can render the saved local image files.
+Protocol:
+  Read exactly one UTF-8 JSON request frame from stdin and write exactly one
+  UTF-8 JSON result to stdout. Configuration and credentials are read only
+  from the adjacent config.json. The v2 protocol has no request/result/status
+  files and does not need stdin EOF.
 
 `;
 
 const REQUEST_FIELDS = new Set([
   "version",
   "command",
-  "statusFile",
+  "workspace",
   "prompt",
   "output",
-  "image",
+  "images",
   "mask",
   "quality",
   "size",
@@ -79,10 +54,6 @@ const REQUEST_FIELDS = new Set([
   "n",
   "overwrite",
   "timeoutMs",
-  "verboseResponse",
-  "inputFidelity",
-  "outputCompression",
-  "user",
 ]);
 
 function parseArgumentValue(rawValue) {
@@ -253,29 +224,6 @@ function writeStderr(value) {
   return writeToStream(process.stderr, value);
 }
 
-function resolveStatusFile(statusFile, cwd) {
-  if (statusFile === undefined || statusFile === null || statusFile === true || statusFile === "") return undefined;
-  return path.resolve(cwd, String(statusFile));
-}
-
-async function writeStatusFile(statusFile, payload) {
-  if (!statusFile) return;
-  await mkdir(path.dirname(statusFile), { recursive: true });
-  const temporaryPath = `${statusFile}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporaryPath, `${stableStringify(payload)}\n`, { mode: 0o600 });
-  await rename(temporaryPath, statusFile);
-}
-
-async function readStatusFile(statusFile) {
-  if (!statusFile) return undefined;
-  try {
-    const parsed = JSON.parse(await readFile(statusFile, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function parseRequestJson(contents, requestSource) {
   // Windows PowerShell 5.1 commonly writes UTF-8 JSON with a BOM.
   const json = contents.charCodeAt(0) === 0xfeff ? contents.slice(1) : contents;
@@ -286,24 +234,96 @@ function parseRequestJson(contents, requestSource) {
   }
 }
 
-async function readRequestStdin() {
-  const chunks = [];
-  let byteLength = 0;
-  for await (const chunk of process.stdin) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    byteLength += bytes.length;
-    if (byteLength > 1024 * 1024) {
-      throw new Error("Request stdin exceeds the 1 MiB limit.");
-    }
-    chunks.push(bytes);
-  }
-  if (byteLength === 0) throw new Error("Request stdin was empty.");
-  return Buffer.concat(chunks).toString("utf8");
+async function readRequestStdin({ timeoutMs = 5000 } = {}) {
+  const maxBytes = 1024 * 1024;
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let byteLength = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onError);
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const candidateIsCompleteJson = (candidate) => {
+      try {
+        const text = candidate.toString("utf8").replace(/^\uFEFF/, "");
+        const parsed = JSON.parse(text);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    };
+    const onData = (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteLength += bytes.length;
+      if (byteLength > maxBytes) {
+        finish(new Error("Request stdin exceeds the 1 MiB limit."));
+        return;
+      }
+      chunks.push(bytes);
+      const all = Buffer.concat(chunks);
+      const newline = all.indexOf(0x0a);
+      if (newline === -1) return;
+      const frame = all.subarray(0, newline);
+      // v2 is one JSON line. For old pretty-printed v1 JSON, retain the data
+      // and allow EOF (still bounded by the input deadline) to complete it.
+      if (frame.length > 0 && candidateIsCompleteJson(frame)) {
+        // A pipe left open by the caller keeps Node's stdin handle alive even
+        // after the request frame has been consumed. Closing our read side is
+        // what makes one-frame v2 exit promptly without waiting for EOF.
+        process.stdin.pause();
+        process.stdin.destroy();
+        finish(null, frame.toString("utf8"));
+      }
+    };
+    const onEnd = () => {
+      if (byteLength === 0) {
+        finish(new Error("Request stdin was empty."));
+        return;
+      }
+      finish(null, Buffer.concat(chunks).toString("utf8"));
+    };
+    const onError = (error) => finish(error);
+    const timeout = setTimeout(() => {
+      // Match the completed-frame path: an open parent pipe must not keep a
+      // timed-out one-frame request alive after its final error is emitted.
+      process.stdin.pause();
+      process.stdin.destroy();
+      finish(new Error(`Request stdin frame timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+
+    process.stdin.on("data", onData);
+    process.stdin.once("end", onEnd);
+    process.stdin.once("error", onError);
+    process.stdin.resume();
+  });
 }
 
-function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, clientRequestId = null, exitCode = null, stage }) {
+function normalizedError(error, fallbackCode = "runner_failed") {
+  if (error && typeof error === "object" && error.error) return error.error;
+  const message = error instanceof Error ? error.message : String(error);
   return {
-    version: 1,
+    code: typeof error?.code === "string" ? error.code : fallbackCode,
+    message,
+    ...(error?.kind ? { kind: error.kind } : {}),
+    retry_safe: false,
+  };
+}
+
+function lifecyclePayload({ command, status, startedAt, timing, saved = [], error = null, requestId = null, clientRequestId = null, exitCode = null, stage, runId = null, retrySafe = false }) {
+  return {
+    version: 2,
+    run_id: runId,
     command,
     status,
     exit_code: exitCode,
@@ -315,71 +335,83 @@ function lifecyclePayload({ command, status, startedAt, timing, saved = [], erro
     request_id: requestId,
     client_request_id: clientRequestId,
     ...(stage ? { stage } : {}),
-    ...(error ? { error } : {}),
+    retry_safe: retrySafe,
   };
 }
 
-function toRequestObject(rawRequest, requestPath) {
+class StructuredRequestError extends Error {
+  constructor(message, payload) {
+    super(message);
+    this.payload = payload;
+  }
+}
+
+function toRequestObject(rawRequest, requestSource) {
   if (!rawRequest || typeof rawRequest !== "object" || Array.isArray(rawRequest)) {
-    throw new Error(`Request file must contain a JSON object: ${requestPath}`);
+    throw new Error(`Request must contain a JSON object: ${requestSource}`);
   }
 
   const request = Object.fromEntries(Object.entries(rawRequest).map(([key, value]) => [
     key.replace(/[_-]([a-z])/gi, (_, char) => char.toUpperCase()),
     value,
   ]));
-  if (request.apiKey !== undefined || request.config !== undefined) {
-    throw new Error("Request files cannot contain apiKey or config. Use the package-root config.json.");
+  if (request.apiKey !== undefined || request.config !== undefined || request.baseURL !== undefined || request.statusFile !== undefined) {
+    throw new Error("v2 requests cannot contain credentials, config, baseURL, or statusFile.");
   }
   const unsupported = Object.keys(request).find((key) => !REQUEST_FIELDS.has(key));
   if (unsupported) throw new Error(`Unsupported request field: ${unsupported}`);
-  if (request.version !== 1) throw new Error("Request file version must be 1.");
+  if (request.version !== 2) throw new Error("Request version must be 2.");
   if (!["generate", "edit"].includes(request.command)) {
     throw new Error("Request command must be generate or edit.");
   }
-  if (typeof request.statusFile !== "string" || !path.isAbsolute(request.statusFile)) {
-    throw new Error("Request statusFile must be an absolute path.");
+  if (request.output !== undefined && (typeof request.output !== "string" || !path.isAbsolute(request.output))) {
+    throw new Error("Request output must be an absolute path when provided.");
   }
-  if (typeof request.output !== "string" || !path.isAbsolute(request.output)) {
-    throw new Error("Request output must be an absolute path.");
+  if (request.workspace !== undefined && (typeof request.workspace !== "string" || !path.isAbsolute(request.workspace))) {
+    throw new Error("Request workspace must be an absolute path when provided.");
   }
   if (request.mask !== undefined && (typeof request.mask !== "string" || !path.isAbsolute(request.mask))) {
     throw new Error("Request mask must be an absolute path.");
   }
-  if (request.image !== undefined) {
-    const images = Array.isArray(request.image) ? request.image : [request.image];
+  if (request.images !== undefined) {
+    const images = Array.isArray(request.images) ? request.images : [request.images];
     if (!images.every((image) => typeof image === "string" && path.isAbsolute(image))) {
-      throw new Error("Request image must contain only absolute paths.");
+      throw new Error("Request images must contain only absolute paths.");
     }
   }
 
-  const { command, statusFile, version, ...options } = request;
+  const { command, version, images, ...options } = request;
   return {
     command,
     options: {
-      image: [],
+      image: images ?? [],
       ...options,
-      statusFile: path.resolve(statusFile),
     },
   };
 }
 
-function requestFailurePayload(command, message, startedAt, startedAtPerformance) {
-  return lifecyclePayload({
+function requestFailurePayload(command, error, startedAt, startedAtPerformance, stage = "input") {
+  const payload = lifecyclePayload({
     command,
     status: "failed",
     startedAt,
     timing: { total: Math.round(performance.now() - startedAtPerformance) },
     exitCode: 1,
-    stage: "initialization",
-    error: { message },
+    stage,
+    error: {
+      ...normalizedError(error, stage === "input" ? "input_invalid" : "initialization_failed"),
+      retry_safe: true,
+    },
+    retrySafe: true,
   });
+  payload.phase = stage;
+  return payload;
 }
 
 async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
   const startedAt = new Date().toISOString();
   const startedAtPerformance = performance.now();
-  let statusFile;
+  const runId = randomUUID();
   let command = "run";
 
   try {
@@ -388,39 +420,22 @@ async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
     if (argv.length === 1 && argv[0] === "--request-stdin") {
       requestSource = "stdin";
       rawRequest = parseRequestJson(await readRequestStdin(), requestSource);
-    } else if (argv.length === 2 && argv[0] === "--request-file" && argv[1]) {
-      if (!path.isAbsolute(argv[1])) {
-        throw new Error("Request file must be an absolute path.");
-      }
-      requestSource = path.resolve(argv[1]);
-      rawRequest = parseRequestJson(await readFile(requestSource, "utf8"), requestSource);
     } else {
       throw new Error("Usage: niucodes-image-gen run --request-stdin");
     }
-    if (rawRequest && typeof rawRequest === "object" && !Array.isArray(rawRequest)
-      && typeof rawRequest.statusFile === "string" && path.isAbsolute(rawRequest.statusFile)) {
-      statusFile = path.resolve(rawRequest.statusFile);
-    }
     const request = toRequestObject(rawRequest, requestSource);
     command = request.command;
-    statusFile = request.options.statusFile;
     const payload = await executeImageCommand(command, request.options, { cwd });
-    const finalPayload = await readStatusFile(statusFile) ?? payload;
-    await writeStdout(`${stableStringify(finalPayload)}\n`);
+    await writeStdout(`${JSON.stringify(payload)}\n`);
     return 0;
   } catch (error) {
     const message = formatOpenAIError(error);
-    let payload = await readStatusFile(statusFile);
-    if (!payload || !["success", "failed"].includes(payload.status)) {
-      payload = requestFailurePayload(command, message, startedAt, startedAtPerformance);
-      try {
-        await writeStatusFile(statusFile, payload);
-      } catch (statusError) {
-        await writeStderr(`Unable to write status file: ${formatOpenAIError(statusError)}\n`);
-      }
-    }
+    const payload = error instanceof StructuredRequestError
+      ? error.payload
+      : requestFailurePayload(command, error, startedAt, startedAtPerformance);
+    payload.run_id ??= runId;
     await writeStderr(`${message}\n`);
-    await writeStdout(`${stableStringify(payload)}\n`);
+    await writeStdout(`${JSON.stringify(payload)}\n`);
     return Number.isInteger(payload.exit_code) && payload.exit_code !== 0 ? payload.exit_code : 1;
   }
 }
@@ -435,25 +450,33 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     throw new Error("--api-key is not supported. Set apiKey in config.json.");
   }
 
-  const statusFile = resolveStatusFile(options.statusFile, cwd);
   let invocation;
+  let requestStarted = false;
   const clientRequestId = randomUUID();
+  const runId = randomUUID();
+  let phase = "initialization";
 
   try {
-    const verboseResponse = resolveVerboseResponse(options.verboseResponse);
+    const verboseResponse = false;
     const resolveStartedAt = performance.now();
     invocation = await resolveInvocation(command, options, { cwd });
     invocation.clientRequestId = clientRequestId;
     const resolveDurationMs = Math.round(performance.now() - resolveStartedAt);
-    await writeStatusFile(statusFile, lifecyclePayload({
+    const outputStartedAt = performance.now();
+    const outputTargets = await resolveOutputTargets({
       command: invocation.command,
-      status: "running",
-      startedAt,
-      timing: { total: Math.round(performance.now() - cliStartedAt) },
-      exitCode: null,
-      stage: "request",
-      clientRequestId,
-    }));
+      cwd,
+      model: invocation.model,
+      output: invocation.output,
+      outputFormat: invocation.outputFormat,
+      overwrite: invocation.overwrite,
+      count: invocation.n,
+      outputIsDirectory: invocation.outputIsDirectory,
+    });
+    await assertOutputTargetsWritable(outputTargets);
+    const outputPrepareMs = Math.round(performance.now() - outputStartedAt);
+    requestStarted = true;
+    phase = "upload_or_delivery_unknown";
     const {
       response: apiResponse,
       inputPrepareMs,
@@ -463,20 +486,10 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       streamCompletedFrameTerminated,
       streamPartialEventCount,
     } = await createImageRequest(invocation, { clientRequestId });
-    const outputStartedAt = performance.now();
-    const outputTargets = await resolveOutputTargets({
-      command: invocation.command,
-      cwd,
-      model: invocation.model,
-      output: invocation.output,
-      outputFormat: invocation.outputFormat,
-      overwrite: invocation.overwrite,
-      count: Array.isArray(apiResponse?.data) && apiResponse.data.length > 0 ? apiResponse.data.length : invocation.n,
-    });
-    const outputPrepareMs = Math.round(performance.now() - outputStartedAt);
-
+    phase = "save";
+    const postApiStartedAt = performance.now();
     const saveStartedAt = performance.now();
-    const savedItems = await saveImageItems(apiResponse, outputTargets, invocation.timeoutMs);
+    const savedItems = await saveImageItems(apiResponse, outputTargets, { overwrite: invocation.overwrite });
     const saveDurationMs = Math.round(performance.now() - saveStartedAt);
     const totalMs = Math.round(performance.now() - cliStartedAt);
     const payload = buildResponse(
@@ -494,36 +507,63 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         stream_completed_frame_terminated: streamCompletedFrameTerminated,
         stream_partial_events: streamPartialEventCount,
         output_prepare: outputPrepareMs,
+        decode_save: saveDurationMs,
         save: saveDurationMs,
+        finalize: 0,
+        post_complete: Math.round(performance.now() - postApiStartedAt),
+        post_api: Math.round(performance.now() - postApiStartedAt),
         non_api: totalMs - apiDurationMs,
         total: totalMs,
       },
     );
+    payload.version = 2;
+    payload.run_id = runId;
+    payload.started_at = startedAt;
+    payload.completed_at = new Date().toISOString();
+    payload.stage = "complete";
+    payload.phase = "complete";
+    payload.retry_safe = false;
+    payload.timing_ms.local_overhead = payload.timing_ms.non_api;
 
-    await writeStatusFile(statusFile, { ...payload, version: 1, started_at: startedAt, completed_at: new Date().toISOString(), stage: "complete" });
     return payload;
   } catch (error) {
-    try {
-      await writeStatusFile(statusFile, lifecyclePayload({
-        command: invocation?.command ?? command,
-        status: "failed",
-        startedAt,
-        timing: { total: Math.round(performance.now() - cliStartedAt) },
-        stage: invocation && isRequestDeliveryUnknown(error) ? "request_delivery_unknown" : invocation ? "request_or_save" : "initialization",
-        error: describeOpenAIError(error),
-        clientRequestId: invocation ? clientRequestId : null,
-        exitCode: 1,
-      }));
-    } catch (statusError) {
-      await writeStderr(`Unable to write status file: ${formatOpenAIError(statusError)}\n`);
-    }
+    const describedError = describeOpenAIError(error);
+    const failurePhase = error?.phase
+      ?? (requestStarted && isRequestDeliveryUnknown(error) ? "upload_or_delivery_unknown" : phase);
+    const failure = lifecyclePayload({
+      command: invocation?.command ?? command,
+      status: "failed",
+      startedAt,
+      timing: { total: Math.round(performance.now() - cliStartedAt) },
+      stage: failurePhase,
+      error: {
+        ...normalizedError(error, requestStarted ? failurePhase : "initialization_failed"),
+        code: requestStarted && isRequestDeliveryUnknown(error)
+          ? "upload_or_delivery_unknown"
+          : failurePhase === "save"
+            ? "save_failed"
+            : failurePhase === "input"
+              ? "input_invalid"
+              : failurePhase === "response_incomplete"
+                ? "response_incomplete"
+                : "initialization_failed",
+        retry_safe: !requestStarted || failurePhase === "input",
+        ...(describedError.kind ? { kind: describedError.kind } : {}),
+        ...(describedError.transport ? { transport: describedError.transport } : {}),
+      },
+      clientRequestId: invocation ? clientRequestId : null,
+      exitCode: 1,
+      runId,
+      retrySafe: !requestStarted || failurePhase === "input",
+    });
+    failure.phase = failure.stage;
     if (invocation?.output) {
       const outputExists = await fileExists(invocation.output);
       if (outputExists) {
         await writeStderr(`Output target already exists: ${invocation.output}\n`);
       }
     }
-    throw new Error(formatOpenAIError(error));
+    throw new StructuredRequestError(formatOpenAIError(error), failure);
   }
 }
 
@@ -531,15 +571,11 @@ export async function runCli(argv, { cwd = process.cwd() } = {}) {
   if (argv[0] === "run") {
     return runStructuredRequest(argv.slice(1), { cwd });
   }
-  const parsed = parseArgs(argv);
-  if (parsed.help) {
+  if (argv[0] === "--help" || argv[0] === "-h" || argv.length === 0) {
     await writeStdout(`${HELP_TEXT}\n`);
     return 0;
   }
-
-  const payload = await executeImageCommand(parsed.command, parsed.options, { cwd });
-  await writeStdout(`${stableStringify(payload)}\n`);
-  return 0;
+  throw new Error("Usage: niucodes-image-gen run --request-stdin");
 }
 
 export { HELP_TEXT, parseArgs, runStructuredRequest, toRequestObject };

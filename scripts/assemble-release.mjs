@@ -56,7 +56,6 @@ await cp(path.join(stagingDir, `${packageName}-macos-arm64`), universalRoot, { r
 for (const platform of platforms.slice(1)) {
   const unpackedRoot = path.join(stagingDir, `${packageName}-${platform}`);
   await cp(path.join(unpackedRoot, "bin"), path.join(universalRoot, "bin"), { recursive: true, force: true });
-  await cp(path.join(unpackedRoot, "scripts"), path.join(universalRoot, "scripts"), { recursive: true, force: true });
 }
 
 const universalArchive = `${packageName}-v${version}.zip`;

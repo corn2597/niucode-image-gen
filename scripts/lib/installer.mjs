@@ -1,9 +1,10 @@
-import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import TOML from "@iarna/toml";
 
-import { resolveSkillRoot } from "./image-client.mjs";
+import { defaultOutputDirectory, legacyPicturesOutputDirectory, resolveSkillRoot } from "./image-client.mjs";
 
 const SKILL_NAME = "niucodes-image-gen";
 const LEGACY_SERVER_NAME = "niucodes_image_gen";
@@ -21,6 +22,23 @@ export function defaultInstallDir(home = os.homedir()) {
 
 export function defaultConfigPath(home = os.homedir()) {
   return path.join(home, ".codex", "config.toml");
+}
+
+export function mergeSandboxWritableRoot(configText, writableRoot) {
+  const parsed = TOML.parse(configText || "");
+  const sandbox = parsed.sandbox_workspace_write ?? {};
+  if (!sandbox || typeof sandbox !== "object" || Array.isArray(sandbox)) {
+    throw new Error("[sandbox_workspace_write] must be a TOML table.");
+  }
+  const currentRoots = sandbox.writable_roots ?? [];
+  if (!Array.isArray(currentRoots) || !currentRoots.every((value) => typeof value === "string")) {
+    throw new Error("sandbox_workspace_write.writable_roots must be an array of strings.");
+  }
+  const normalizedRoot = path.resolve(writableRoot);
+  if (currentRoots.some((value) => path.resolve(value) === normalizedRoot)) return configText;
+  sandbox.writable_roots = [...currentRoots, normalizedRoot];
+  parsed.sandbox_workspace_write = sandbox;
+  return TOML.stringify(parsed);
 }
 
 export function removeLegacyMcpServerConfig(configText) {
@@ -83,6 +101,63 @@ export async function setInstalledApiKey(installDir, apiKey) {
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 }
 
+async function ensureOutputConfig(installDir, { home, platform }) {
+  const configPath = path.join(installDir, "config.json");
+  let config;
+  try {
+    config = JSON.parse(await readFile(configPath, "utf8"));
+  } catch {
+    throw new Error(`Unable to read installed config file: ${configPath}`);
+  }
+  const configuredOutputDir = typeof config.defaultOutputDir === "string" && config.defaultOutputDir.trim()
+    ? path.resolve(config.defaultOutputDir)
+    : undefined;
+  const oldDefaultOutputDir = path.resolve(legacyPicturesOutputDirectory({ home, platform }));
+  const outputDir = configuredOutputDir && configuredOutputDir !== oldDefaultOutputDir
+    ? configuredOutputDir
+    : path.resolve(defaultOutputDirectory({ home, platform }));
+  config.defaultOutputDir = outputDir;
+  // v1.4.x used 570 seconds internally to reserve a local save window. The
+  // native v2 runner saves after the completed event, so migrate only that old
+  // default to the documented full ten-minute request deadline. Respect any
+  // user-selected value.
+  if (config.timeoutMs === undefined || Number(config.timeoutMs) === 570000) {
+    config.timeoutMs = 600000;
+  }
+  await mkdir(outputDir, { recursive: true });
+  const temporaryPath = `${configPath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, configPath);
+  return outputDir;
+}
+
+async function updateCodexSandboxConfig(configPath, writableRoot) {
+  let currentConfig = "";
+  let existed = false;
+  if (await exists(configPath)) {
+    currentConfig = await readFile(configPath, "utf8");
+    existed = true;
+  }
+  const withoutLegacy = removeLegacyMcpServerConfig(currentConfig);
+  const updated = mergeSandboxWritableRoot(withoutLegacy, writableRoot);
+  if (updated === currentConfig) return { changed: false, backupPath: null, removedLegacyMcpConfig: false };
+
+  await mkdir(path.dirname(configPath), { recursive: true });
+  let backupPath = null;
+  if (existed) {
+    backupPath = `${configPath}.niucodes-image-gen.${Date.now()}.bak`;
+    await writeFile(backupPath, currentConfig, { mode: 0o600 });
+  }
+  const temporaryPath = `${configPath}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, updated, { mode: 0o600 });
+  await rename(temporaryPath, configPath);
+  return {
+    changed: true,
+    backupPath,
+    removedLegacyMcpConfig: withoutLegacy !== currentConfig,
+  };
+}
+
 function promptForApiKey() {
   if (!process.stdin.isTTY || !process.stdin.setRawMode) {
     throw new Error("API key input requires an interactive terminal.");
@@ -140,6 +215,7 @@ export async function installSkill({
   configPath = defaultConfigPath(),
   platform = process.platform,
   arch = process.arch,
+  home = os.homedir(),
 } = {}) {
   const sourceRoot = path.resolve(packageRoot);
   const targetRoot = path.resolve(installDir);
@@ -151,22 +227,18 @@ export async function installSkill({
   if (!(await exists(executable))) {
     throw new Error(`Installed executable was not found: ${executable}`);
   }
-  let removedLegacyMcpConfig = false;
-  if (await exists(configPath)) {
-    const currentConfig = await readFile(configPath, "utf8");
-    const updatedConfig = removeLegacyMcpServerConfig(currentConfig);
-    if (updatedConfig !== currentConfig) {
-      await writeFile(configPath, updatedConfig, { mode: 0o600 });
-      removedLegacyMcpConfig = true;
-    }
-  }
+  const defaultOutputDir = await ensureOutputConfig(targetRoot, { home, platform });
+  const sandboxConfig = await updateCodexSandboxConfig(path.resolve(configPath), defaultOutputDir);
   return {
     status: "success",
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
     executable,
-    protocol: "stream-stdin-v2",
-    removed_legacy_mcp_config: removedLegacyMcpConfig,
+    protocol: "stream-stdin-v2-single-frame",
+    removed_legacy_mcp_config: sandboxConfig.removedLegacyMcpConfig,
+    sandbox_config_updated: sandboxConfig.changed,
+    config_backup_path: sandboxConfig.backupPath,
+    default_output_dir: defaultOutputDir,
     restart_required: true,
   };
 }

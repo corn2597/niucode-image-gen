@@ -1,13 +1,18 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath, stat } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import { File, FormData, ProxyAgent, fetch } from "undici";
+import { Agent, File, FormData, ProxyAgent, fetch } from "undici";
 
 export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
+export const DEFAULT_TIMEOUT_MS = 600000;
 const MAX_STREAM_BYTES = 100 * 1024 * 1024;
+const MAX_INPUT_IMAGES = 8;
+const MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024;
+const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024;
 
 function normalizeObjectKeys(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
@@ -118,6 +123,65 @@ function isPathWithin(parentPath, candidatePath) {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+export function defaultOutputDirectory({
+  home = os.homedir(),
+  platform = process.platform,
+  env = process.env,
+} = {}) {
+  // This directory is persistent user application data, not a system temp
+  // directory. It is the most reliable fallback when Codex has no workspace.
+  const platformPath = platform === "win32" ? path.win32 : path.posix;
+  if (platform === "win32") {
+    return platformPath.join(env.LOCALAPPDATA || platformPath.join(home, "AppData", "Local"), "niucodes-image-gen", "outputs");
+  }
+  if (platform === "darwin") {
+    return platformPath.join(home, "Library", "Application Support", "niucodes-image-gen", "outputs");
+  }
+  return platformPath.join(env.XDG_DATA_HOME || platformPath.join(home, ".local", "share"), "niucodes-image-gen", "outputs");
+}
+
+export function legacyPicturesOutputDirectory({ home = os.homedir(), platform = process.platform } = {}) {
+  const platformPath = platform === "win32" ? path.win32 : path.posix;
+  return platformPath.join(home, "Pictures", "niucodes-image-gen");
+}
+
+async function canonicalPath(value) {
+  try {
+    return await realpath(value);
+  } catch {
+    return path.resolve(value);
+  }
+}
+
+function systemTemporaryRoots(platform = process.platform, env = process.env) {
+  const roots = [os.tmpdir(), env.TMPDIR, env.TMP, env.TEMP].filter(Boolean);
+  if (platform === "darwin") roots.push("/tmp", "/private/tmp", "/var/folders", "/private/var/folders");
+  if (platform === "linux") roots.push("/tmp", "/var/tmp");
+  if (platform === "win32") {
+    roots.push(
+      env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Temp"),
+      env.SystemRoot && path.join(env.SystemRoot, "Temp"),
+    );
+  }
+  return [...new Set(roots.filter(Boolean).map((root) => path.resolve(root)))];
+}
+
+async function taskOutputDirectory(cwd, skillRoot) {
+  const rawCwd = path.resolve(cwd);
+  const resolvedCwd = await canonicalPath(rawCwd);
+  const rawSkillRoot = path.resolve(skillRoot);
+  const resolvedSkillRoot = await canonicalPath(rawSkillRoot);
+  // A packaged executable is normally launched from a Codex task workspace.
+  // Never treat the installed skill itself as a task workspace.
+  // System temp locations are not durable task workspaces. The caller falls
+  // back to a persistent user-owned application directory instead.
+  if (isPathWithin(rawSkillRoot, rawCwd) || isPathWithin(resolvedSkillRoot, resolvedCwd)) return undefined;
+  for (const temporaryRoot of systemTemporaryRoots()) {
+    if (isPathWithin(temporaryRoot, rawCwd) || isPathWithin(await canonicalPath(temporaryRoot), resolvedCwd)) return undefined;
+  }
+  return path.join(resolvedCwd, "image-outputs", "niucodes-image-gen");
+}
+
 async function readConfigFile(configPath, cwd) {
   const resolvedPath = resolveConfigPath(configPath, cwd);
   try {
@@ -130,10 +194,20 @@ async function readConfigFile(configPath, cwd) {
   }
 }
 
-async function assertLocalFile(filePath) {
+async function assertLocalFile(filePath, inputState) {
   const resolved = path.resolve(filePath);
   try {
-    await readFile(resolved);
+    const entry = await stat(resolved);
+    if (!entry.isFile()) throw new Error("not a regular file");
+    if (entry.size > MAX_INPUT_IMAGE_BYTES) {
+      throw new Error(`exceeds the ${MAX_INPUT_IMAGE_BYTES} byte per-file limit`);
+    }
+    if (inputState) {
+      inputState.totalBytes += entry.size;
+      if (inputState.totalBytes > MAX_TOTAL_INPUT_BYTES) {
+        throw new Error(`exceeds the ${MAX_TOTAL_INPUT_BYTES} byte total limit`);
+      }
+    }
     return resolved;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -151,8 +225,8 @@ function detectMimeType(filePath) {
   }
 }
 
-async function toUploadable(filePath) {
-  const resolved = await assertLocalFile(filePath);
+async function toUploadable(filePath, inputState) {
+  const resolved = await assertLocalFile(filePath, inputState);
   const bytes = await readFile(resolved);
   return new File([bytes], path.basename(resolved), { type: detectMimeType(resolved) });
 }
@@ -223,13 +297,14 @@ function partialEventType(command) {
 }
 
 class ImageHttpError extends Error {
-  constructor(message, { status, requestId, code, cause, deliveryUnknown = false } = {}) {
+  constructor(message, { status, requestId, code, cause, deliveryUnknown = false, phase } = {}) {
     super(message, cause ? { cause } : undefined);
     this.name = "ImageHttpError";
     if (status !== undefined) this.status = status;
     if (requestId) this.request_id = requestId;
     if (code) this.code = code;
     this.deliveryUnknown = deliveryUnknown;
+    if (phase) this.phase = phase;
   }
 }
 
@@ -370,8 +445,9 @@ async function consumeImageStream(response, invocation, lifecycle) {
     const completed = inspectPayload(dataLines.join("\n"), false);
     if (completed) return completed;
   } finally {
-    await reader.cancel().catch(() => undefined);
-    lifecycle.throwIfAborted();
+    // A completed Base64 payload is terminal. Do not wait for an upstream
+    // proxy to acknowledge cancellation or close its SSE socket.
+    void reader.cancel().catch(() => undefined);
   }
 
   throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
@@ -382,6 +458,18 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   const merged = mergeDefinedObjects(config, cliOptions);
   const defaultSize = command === "generate" ? DEFAULT_GENERATE_SIZE : DEFAULT_EDIT_SIZE;
   const images = parseStringArray(cliOptions.image.length > 0 ? cliOptions.image : merged.image);
+  const workspace = cliOptions.workspace === undefined || cliOptions.workspace === null || cliOptions.workspace === ""
+    ? undefined
+    : String(cliOptions.workspace);
+  if (workspace !== undefined && !path.isAbsolute(workspace)) {
+    throw new Error("workspace must be an absolute path.");
+  }
+  const configuredOutput = parseString(config.defaultOutputDir, undefined);
+  const skillRoot = resolveSkillRoot();
+  const defaultOutput = workspace
+    ? path.join(path.resolve(workspace), "image-outputs", "niucodes-image-gen")
+    : await taskOutputDirectory(cwd, skillRoot) || configuredOutput || defaultOutputDirectory();
+  const explicitOutput = parseString(merged.output, undefined);
   const invocation = {
     command,
     cwd,
@@ -392,7 +480,8 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     proxyUrl: parseProxyUrl(config.proxyUrl),
     model: parseString(merged.model, "gpt-image-2"),
     prompt: parsePrompt(merged.prompt),
-    output: parseString(merged.output, undefined),
+    output: explicitOutput ?? defaultOutput,
+    outputIsDirectory: explicitOutput === undefined,
     outputFormat: validateChoice(parseString(merged.outputFormat, "png"), "outputFormat", ["png", "jpeg", "webp"]),
     quality: validateChoice(parseString(merged.quality, "auto"), "quality", ["auto", "low", "medium", "high"]),
     size: parseString(merged.size, defaultSize),
@@ -400,19 +489,20 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     moderation: validateChoice(parseString(merged.moderation, "auto"), "moderation", ["auto", "low"]),
     inputFidelity: validateChoice(parseString(merged.inputFidelity, undefined), "inputFidelity", ["low", "high"]),
     outputCompression: parseInteger(merged.outputCompression, "outputCompression", { min: 0, max: 100 }),
-    n: parseInteger(merged.n, "n", { min: 1, max: 10, fallback: 1 }),
-    timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: 600000 }),
+    n: parseInteger(merged.n, "n", { min: 1, max: 1, fallback: 1 }),
+    // The configured timeout is the actual request deadline. A completed
+    // image received before it is always saved and reported, even if that
+    // final local write crosses the deadline by a few milliseconds.
+    timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: DEFAULT_TIMEOUT_MS }),
     overwrite: parseBoolean(merged.overwrite, false),
     mask: parseString(merged.mask, undefined),
     user: parseString(merged.user, undefined),
     images,
+    workspace: workspace ? path.resolve(workspace) : undefined,
   };
 
   if (!invocation.prompt) throw new Error("Missing prompt. Pass --prompt.");
-  if (!invocation.output) {
-    throw new Error("Missing output directory. Pass --output <directory> outside the skill directory.");
-  }
-
+  if (!invocation.apiKey) throw new Error("Missing apiKey in config.json.");
   const outputPath = path.resolve(cwd, invocation.output);
   if (isPathWithin(resolveSkillRoot(), outputPath)) {
     throw new Error("Output must be outside the skill directory. Pass --output <directory> in a user-owned location.");
@@ -425,6 +515,9 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
   if (command === "generate" && invocation.mask) throw new Error("generate does not accept --mask.");
   if (command === "generate" && invocation.inputFidelity) throw new Error("generate does not accept --input-fidelity.");
   if (command === "edit" && invocation.images.length === 0) throw new Error("edit requires at least one --image <local-path>.");
+  if (invocation.images.length > MAX_INPUT_IMAGES) {
+    throw new Error(`edit supports at most ${MAX_INPUT_IMAGES} input images.`);
+  }
   return invocation;
 }
 
@@ -451,9 +544,11 @@ async function createRequestBody(invocation) {
   const preparationStartedAt = performance.now();
   const form = new FormData();
   for (const [key, value] of Object.entries(payload)) appendFormValue(form, key, value);
-  const images = await Promise.all(invocation.images.map((filePath) => toUploadable(path.resolve(invocation.cwd, filePath))));
-  for (const image of images) form.append("image", image);
-  if (invocation.mask) form.append("mask", await toUploadable(path.resolve(invocation.cwd, invocation.mask)));
+  const inputState = { totalBytes: 0 };
+  for (const filePath of invocation.images) {
+    form.append("image", await toUploadable(path.resolve(invocation.cwd, filePath), inputState));
+  }
+  if (invocation.mask) form.append("mask", await toUploadable(path.resolve(invocation.cwd, invocation.mask), inputState));
   if (invocation.inputFidelity) appendFormValue(form, "input_fidelity", invocation.inputFidelity);
   return { body: form, inputPrepareMs: Math.round(performance.now() - preparationStartedAt) };
 }
@@ -479,11 +574,16 @@ async function responseError(response, requestId) {
 }
 
 async function createTransport(proxyUrl) {
-  const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : null;
+  // Never use fetch's global dispatcher for a one-shot executable. Its idle
+  // keep-alive socket can keep the packaged Node event loop alive long after a
+  // completed Base64 image has already been written to disk.
+  const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : new Agent();
   return {
     dispatcher,
-    async close() {
-      if (dispatcher) await dispatcher.close();
+    close() {
+      // destroy() tears down a streaming or idle keep-alive socket immediately.
+      // close() may otherwise wait for the peer EOF after a completed image event.
+      void dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined);
     },
   };
 }
@@ -492,7 +592,14 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
   const transport = await createTransport(invocation.proxyUrl);
   const lifecycle = createRequestLifecycle(invocation.timeoutMs);
   try {
-    const { body, contentType, inputPrepareMs = 0 } = await createRequestBody(invocation);
+    let requestBody;
+    try {
+      requestBody = await createRequestBody(invocation);
+    } catch (error) {
+      error.phase = "input";
+      throw error;
+    }
+    const { body, contentType, inputPrepareMs = 0 } = requestBody;
     lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
     let response;
@@ -506,7 +613,7 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
         },
         body,
         signal: lifecycle.signal,
-        ...(transport.dispatcher ? { dispatcher: transport.dispatcher } : {}),
+        dispatcher: transport.dispatcher,
       });
     } catch (error) {
       lifecycle.throwIfAborted();
@@ -514,11 +621,22 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
         code: error?.cause?.code ?? error?.code,
         cause: error,
         deliveryUnknown: true,
+        phase: "upload_or_delivery_unknown",
       });
     }
     const requestId = requestIdFromResponse(response);
-    if (!response.ok) throw await responseError(response, requestId);
-    const consumed = await consumeImageStream(response, invocation, lifecycle);
+    if (!response.ok) {
+      const error = await responseError(response, requestId);
+      error.phase = "response_incomplete";
+      throw error;
+    }
+    let consumed;
+    try {
+      consumed = await consumeImageStream(response, invocation, lifecycle);
+    } catch (error) {
+      error.phase ??= "response_incomplete";
+      throw error;
+    }
     return {
       response: { data: consumed.completed, _request_id: requestId },
       inputPrepareMs,
@@ -529,11 +647,19 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
       streamPartialEventCount: consumed.partialEventCount,
     };
   } catch (error) {
-    lifecycle.throwIfAborted();
+    try {
+      lifecycle.throwIfAborted();
+    } catch (abortError) {
+      // Preserve the phase in which cancellation happened. Otherwise an
+      // abort while reading a received SSE response looks like a connection
+      // failure before upload completed.
+      abortError.phase = error?.phase ?? "upload_or_delivery_unknown";
+      throw abortError;
+    }
     throw error;
   } finally {
     lifecycle.dispose();
-    await transport.close();
+    transport.close();
   }
 }
 
