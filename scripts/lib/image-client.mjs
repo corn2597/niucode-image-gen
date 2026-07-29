@@ -267,18 +267,20 @@ function applySharedPayload(invocation) {
 function createRequestLifecycle(timeoutMs) {
   const controller = new AbortController();
   let abortMessage = null;
+  let abortCode = null;
   let abortListener = null;
 
-  const abort = (message) => {
+  const abort = (message, code = "request_cancelled") => {
     if (abortMessage) return;
     abortMessage = message;
+    abortCode = code;
     controller.abort();
     abortListener?.();
   };
   const onSignal = (signalName) => abort(`Image request cancelled by ${signalName}.`);
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
-  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`), timeoutMs);
+  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`, "timeout"), timeoutMs);
 
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
@@ -290,7 +292,11 @@ function createRequestLifecycle(timeoutMs) {
       if (abortMessage) listener();
     },
     throwIfAborted() {
-      if (abortMessage) throw new Error(abortMessage);
+      if (abortMessage) {
+        const error = new Error(abortMessage);
+        error.code = abortCode ?? "request_cancelled";
+        throw error;
+      }
     },
     dispose() {
       clearTimeout(timeout);
@@ -459,8 +465,10 @@ async function consumeImageStream(response, invocation, lifecycle) {
     if (completed) return completed;
   } finally {
     // A completed Base64 payload is terminal. Do not wait for an upstream
-    // proxy to acknowledge cancellation or close its SSE socket.
-    void reader.cancel().catch(() => undefined);
+    // proxy to close its SSE socket. Await Undici's local cancellation so no
+    // active stream handle keeps the packaged executable alive after stdout
+    // has the final JSON result.
+    await reader.cancel().catch(() => undefined);
   }
 
   throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
@@ -600,10 +608,10 @@ async function createTransport(proxyUrl) {
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : new Agent();
   return {
     dispatcher,
-    close() {
+    async close() {
       // destroy() tears down a streaming or idle keep-alive socket immediately.
       // close() may otherwise wait for the peer EOF after a completed image event.
-      void dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined);
+      await dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined);
     },
   };
 }
@@ -679,7 +687,7 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
     throw error;
   } finally {
     lifecycle.dispose();
-    transport.close();
+    await transport.close();
   }
 }
 

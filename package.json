@@ -1,6 +1,6 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "private": true,
   "description": "Standalone OpenAI Images HTTP wrapper for generation and editing.",
   "type": "module",

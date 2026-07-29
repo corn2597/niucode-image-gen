@@ -109,6 +109,7 @@ test("v2 generate preserves Chinese prompt and returns one strict JSON result", 
     assert.equal(payload.exit_code, 0);
     assert.equal(payload.phase, "complete");
     assert.equal(payload.request_id, "mock-generate");
+    assert.equal(payload.api_request_id, "mock-generate");
     assert.equal(payload.saved.length, 1);
     assert.match(payload.saved[0].absolute_path, /工作区 中文 空格[\\/]image-outputs[\\/]niucodes-image-gen/);
     assert.equal((await readFile(payload.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
@@ -211,8 +212,11 @@ test("timeout uses the configured full deadline and returns a terminal result", 
     }
     assert.ok(failure);
     const payload = JSON.parse(failure.stdout);
-    assert.equal(payload.status, "failed");
+    assert.equal(payload.status, "timeout");
+    assert.equal(payload.exit_code, 124);
     assert.equal(payload.phase, "response_incomplete");
+    assert.equal(payload.error.code, "timeout");
+    assert.equal(payload.retry_safe, false);
     assert.match(payload.error.message, /timed out after 1000ms/i);
   });
   assert.equal(clientClosed, true);

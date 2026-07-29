@@ -151,6 +151,7 @@ function buildResponse(invocation, targets, savedItems, apiResponse, verboseResp
     timing_ms: timing,
     error: null,
     request_id: apiResponse?._request_id ?? null,
+    api_request_id: apiResponse?._request_id ?? null,
     client_request_id: invocation.clientRequestId,
     model: invocation.model,
     base_url: invocation.baseURL ?? DEFAULT_BASE_URL,
@@ -333,6 +334,7 @@ function lifecyclePayload({ command, status, startedAt, timing, saved = [], erro
     timing_ms: timing,
     error,
     request_id: requestId,
+    api_request_id: requestId,
     client_request_id: clientRequestId,
     ...(stage ? { stage } : {}),
     retry_safe: retrySafe,
@@ -555,9 +557,10 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     const describedError = describeOpenAIError(error);
     const failurePhase = error?.phase
       ?? (requestStarted && isRequestDeliveryUnknown(error) ? "upload_or_delivery_unknown" : phase);
+    const isTimeout = error?.code === "timeout";
     const failure = lifecyclePayload({
       command: invocation?.command ?? command,
-      status: "failed",
+      status: isTimeout ? "timeout" : "failed",
       startedAt,
       timing: { total: Math.round(performance.now() - cliStartedAt) },
       stage: failurePhase,
@@ -579,11 +582,13 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         ...(describedError.transport ? { transport: describedError.transport } : {}),
       },
       clientRequestId: invocation ? clientRequestId : null,
-      exitCode: 1,
+      exitCode: isTimeout ? 124 : 1,
       runId,
       retrySafe: !requestStarted || failurePhase === "input",
     });
     failure.phase = failure.stage;
+    failure.api_request_id = error?.request_id ?? failure.api_request_id;
+    failure.request_id = error?.request_id ?? failure.request_id;
     if (invocation?.output) {
       const outputExists = await fileExists(invocation.output);
       if (outputExists) {

@@ -41,4 +41,4 @@ Keep the same terminal process alive until it exits. When an initial terminal ca
 
 The runner saves immediately after a valid `image_generation.completed` or `image_edit.completed` Base64 payload. It does not wait for an SSE delimiter, `[DONE]`, EOF, or proxy connection closure. `config.json` is the only credential source. Never print, inspect, pass, or alter its API key.
 
-Copy `status`, `exit_code`, `timing_ms`, `phase`, and `error` from the native JSON into the final response. Put every returned `saved[*].markdown` string on its own line **verbatim** so the image renders. Do not re-read, copy, encode, or re-save the image.
+Copy `status`, `exit_code`, `timing_ms`, `phase`, `error`, and `api_request_id` from the native JSON into the final response. A request timeout is returned as `status: "timeout"`, `exit_code: 124`, and `retry_safe: false`; do not retry it automatically. Put every returned `saved[*].markdown` string on its own line **verbatim** so the image renders. Do not re-read, copy, encode, or re-save the image.

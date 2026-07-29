@@ -135,6 +135,7 @@ await withMockImagesApi((request, response, body) => {
   }));
   assert.equal(generate.status, "success");
   assert.equal(generate.exit_code, 0);
+  assert.equal(generate.api_request_id, "packaged-generate");
   assert.equal((await readFile(generate.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
   assert.equal(generate.timing_ms.stream_completed_frame_terminated, false);
 
@@ -149,6 +150,7 @@ await withMockImagesApi((request, response, body) => {
   }));
   assert.equal(edit.status, "success");
   assert.equal(edit.exit_code, 0);
+  assert.equal(edit.api_request_id, "packaged-edit");
   assert.equal((await readFile(edit.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
 });
 
