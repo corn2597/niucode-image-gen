@@ -1,6 +1,6 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.6.3",
+  "version": "1.6.4",
   "description": "Native local image generation and editing through the configured OpenAI Images API.",
   "author": {
     "name": "NiuCodes"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "NiuCodes Image Gen",
     "shortDescription": "Native image generation and editing",
-    "longDescription": "Uses a bundled native executable and structured standard input to send streaming image generation and editing requests directly to the configured Images API.",
+    "longDescription": "Uses a bundled native executable with direct generate and edit commands to send one streaming request to the configured Images API.",
     "developerName": "NiuCodes",
     "category": "Productivity",
     "capabilities": ["Write"],

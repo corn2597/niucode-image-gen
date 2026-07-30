@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { cp, mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
@@ -53,21 +53,11 @@ function executableFor(packageRoot) {
   return path.join(packageRoot, "bin", files[0]);
 }
 
-function runNative(executable, request) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(executable, ["run", "--request-stdin"], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-    const stdout = [];
-    const stderr = [];
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      const result = { code, signal, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
-      if (code === 0) resolve(result);
-      else reject(Object.assign(new Error(`native process exited with ${code ?? signal}`), result));
-    });
-    child.stdin.write(`${JSON.stringify(request)}\n`, "utf8");
-    // Keep the pipe open. A valid v2 request must not wait for EOF.
+async function runNative(executable, command, args) {
+  return execFileAsync(executable, [command, ...args], {
+    windowsHide: true,
+    timeout: 15000,
+    maxBuffer: 4 * 1024 * 1024,
   });
 }
 
@@ -142,29 +132,26 @@ await withMockImagesApi((request, response, body) => {
   complete(response, "edit");
 }, async (baseURL) => {
   await writeFile(path.join(packageRoot, "config.json"), JSON.stringify({ apiKey: "packaged-e2e-key", baseURL, timeoutMs: 5000 }));
-  const generate = readResult(await runNative(executable, {
-    version: 2,
-    command: "generate",
-    workspace: path.join(root, "workspace 中文"),
-    prompt: '中文生成 prompt with spaces and "quotes"',
-    quality: "low",
-    size: "1024x1024",
-  }));
+  const generate = readResult(await runNative(executable, "generate", [
+    "--workspace", path.join(root, "workspace 中文"),
+    "--prompt", '中文生成 prompt with spaces and "quotes"',
+    "--quality", "low",
+    "--size", "1024x1024",
+  ]));
   assert.equal(generate.status, "success");
   assert.equal(generate.exit_code, 0);
   assert.equal(generate.api_request_id, "packaged-generate");
   assert.equal((await readFile(generate.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
   assert.equal(generate.timing_ms.stream_completed_frame_terminated, false);
 
-  const edit = readResult(await runNative(executable, {
-    version: 2,
-    command: "edit",
-    workspace: path.join(root, "workspace edit 中文"),
-    prompt: "保留构图，将围巾改为深蓝色",
-    images: [sourceA, sourceB],
-    quality: "low",
-    size: "1024x1024",
-  }));
+  const edit = readResult(await runNative(executable, "edit", [
+    "--workspace", path.join(root, "workspace edit 中文"),
+    "--prompt", "保留构图，将围巾改为深蓝色",
+    "--image", sourceA,
+    "--image", sourceB,
+    "--quality", "low",
+    "--size", "1024x1024",
+  ]));
   assert.equal(edit.status, "success");
   assert.equal(edit.exit_code, 0);
   assert.equal(edit.api_request_id, "packaged-edit");

@@ -266,7 +266,7 @@ export async function installSkill({
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
     executable,
-    protocol: "stream-stdin-v2-single-frame",
+    protocol: "native-direct-v3-with-stdin-compatibility",
     removed_legacy_mcp_config: sandboxConfig.removedLegacyMcpConfig,
     sandbox_config_updated: sandboxConfig.changed || fallbackSandboxConfig.changed,
     config_backup_path: sandboxConfig.backupPath,

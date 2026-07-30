@@ -24,16 +24,20 @@ import {
 const HELP_TEXT = `niucodes-image-gen
 
 Usage:
+  niucodes-image-gen generate --prompt <text> [options]
+  niucodes-image-gen edit --prompt <text> --image <absolute-path> [--image <absolute-path> ...] [options]
   niucodes-image-gen run --request-stdin
 
 Commands:
-  run         Execute one structured request through the native streaming entrypoint.
+  generate    Generate one image and return one structured JSON result.
+  edit        Edit one or more local images and return one structured JSON result.
+  run         Compatibility entrypoint for one structured stdin request.
 
 Protocol:
-  Read exactly one UTF-8 JSON request frame from stdin and write exactly one
-  UTF-8 JSON result to stdout. Configuration and credentials are read only
-  from the adjacent config.json. The v2 protocol has no request/result/status
-  files and does not need stdin EOF.
+  Every command writes exactly one UTF-8 JSON result to stdout. Configuration
+  and credentials are read only from the adjacent config.json. Normal calls
+  use generate/edit directly and require no stdin, request/result/status file,
+  wrapper script, or additional runtime.
 
 `;
 
@@ -54,6 +58,14 @@ const REQUEST_FIELDS = new Set([
   "n",
   "overwrite",
   "timeoutMs",
+  "inputFidelity",
+  "outputCompression",
+  "user",
+]);
+
+const DIRECT_OPTION_FIELDS = new Set([
+  ...REQUEST_FIELDS,
+  "image",
 ]);
 
 function parseArgumentValue(rawValue) {
@@ -478,6 +490,34 @@ async function runStructuredRequest(argv, { cwd = process.cwd() } = {}) {
   }
 }
 
+async function runDirectCommand(command, argv, { cwd = process.cwd() } = {}) {
+  const startedAt = new Date().toISOString();
+  const startedAtPerformance = performance.now();
+  const runId = randomUUID();
+
+  try {
+    const parsed = parseArgs([command, ...argv]);
+    if (parsed.help) {
+      await writeStdout(`${HELP_TEXT}\n`);
+      return 0;
+    }
+    const unsupported = Object.keys(parsed.options).find((key) => !DIRECT_OPTION_FIELDS.has(key));
+    if (unsupported) throw new Error(`Unsupported option: --${unsupported.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`);
+    const payload = await executeImageCommand(command, parsed.options, { cwd, runId });
+    await writeStdout(`${JSON.stringify(payload)}\n`);
+    return 0;
+  } catch (error) {
+    const message = formatOpenAIError(error);
+    const payload = error instanceof StructuredRequestError
+      ? error.payload
+      : requestFailurePayload(command, error, startedAt, startedAtPerformance);
+    payload.run_id ??= runId;
+    await writeStderr(`${message}\n`);
+    await writeStdout(`${JSON.stringify(payload)}\n`);
+    return Number.isInteger(payload.exit_code) && payload.exit_code !== 0 ? payload.exit_code : 1;
+  }
+}
+
 export async function executeImageCommand(command, options, { cwd = process.cwd(), runId = randomUUID() } = {}) {
   const cliStartedAt = performance.now();
   const startedAt = new Date().toISOString();
@@ -603,6 +643,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
 }
 
 export async function runCli(argv, { cwd = process.cwd() } = {}) {
+  if (["generate", "edit"].includes(argv[0])) {
+    return runDirectCommand(argv[0], argv.slice(1), { cwd });
+  }
   if (argv[0] === "run") {
     return runStructuredRequest(argv.slice(1), { cwd });
   }
@@ -610,7 +653,13 @@ export async function runCli(argv, { cwd = process.cwd() } = {}) {
     await writeStdout(`${HELP_TEXT}\n`);
     return 0;
   }
-  throw new Error("Usage: niucodes-image-gen run --request-stdin");
+  const startedAt = new Date().toISOString();
+  const startedAtPerformance = performance.now();
+  const command = typeof argv[0] === "string" ? argv[0] : "unknown";
+  const payload = requestFailurePayload(command, new Error(`Unsupported command: ${command}`), startedAt, startedAtPerformance);
+  await writeStderr(`${payload.error.message}\n`);
+  await writeStdout(`${JSON.stringify(payload)}\n`);
+  return 1;
 }
 
-export { HELP_TEXT, parseArgs, runStructuredRequest, toRequestObject };
+export { HELP_TEXT, parseArgs, runDirectCommand, runStructuredRequest, toRequestObject };

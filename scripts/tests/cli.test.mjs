@@ -77,24 +77,84 @@ function parseOneJson(result) {
   return JSON.parse(result.stdout);
 }
 
-test("v2 skill documentation mandates one native stdin request and no status files", async () => {
+test("skill documentation uses direct native commands and preserves nested terminal results", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
+  const agentMetadata = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
+  assert.match(skill, /generate --prompt/);
+  assert.match(skill, /edit --prompt/);
   assert.match(skill, /run --request-stdin/);
-  assert.match(skill, /next tool call one `functions\.exec` call/i);
   assert.match(skill, /Open the installed `SKILL\.md` exactly once/i);
   assert.match(skill, /Do not inspect memory, config, the source image/);
-  assert.match(skill, /tools\.write_stdin/);
+  assert.match(skill, /functions\.exec/);
+  assert.match(skill, /tools\.exec_command/);
   assert.match(skill, /while \(result\.session_id\)/);
-  assert.match(skill, /chars: `\$\{requestJson\}\\n`/);
-  assert.match(skill, /tty: true/);
-  assert.match(skill, /cannot replace `tools\.write_stdin`/i);
-  assert.match(skill, /Script running with cell ID <id>/);
+  assert.match(skill, /tools\.write_stdin/);
+  assert.match(skill, /output\.push\(result\.output/);
   assert.match(skill, /functions\.wait/);
-  assert.match(skill, /never answer while either remains active/i);
-  assert.match(skill, /Do not confuse the outer `cell_id` with the nested terminal `session_id`/i);
-  assert.match(skill, /does not require stdin EOF/i);
+  assert.match(skill, /direct `shell_command`-style tool/);
+  assert.match(skill, /Never call `tools\.exec_command` or `tools\.write_stdin` when those functions are not exposed/);
+  assert.match(skill, /client_request_id/);
+  assert.match(skill, /Do not create a PowerShell\/Bash\/CMD wrapper/i);
   assert.doesNotMatch(skill, /request-file/i);
   assert.doesNotMatch(skill, /status-file/i);
+  assert.match(agentMetadata, /\$niucodes-image-gen/);
+  assert.match(agentMetadata, /prompt verbatim/i);
+  assert.doesNotMatch(agentMetadata, /prompt rewriting/i);
+});
+
+test("direct generate command preserves Chinese spaces and quotes in one structured result", async () => {
+  const root = await tempDir();
+  const workspace = path.join(root, "direct workspace 中文 空格");
+  let requests = 0;
+  await withMockImagesApi((request, response, body) => {
+    requests += 1;
+    assert.equal(request.url, "/v1/images/generations");
+    assert.equal(JSON.parse(body).prompt, '直接参数：猫咪说 "hello world"');
+    completed(response, "generate");
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill direct");
+    await writeConfig(skillRoot, baseURL);
+    const result = await execFileAsync(process.execPath, [
+      scriptPath,
+      "generate",
+      "--prompt", '直接参数：猫咪说 "hello world"',
+      "--workspace", workspace,
+      "--quality", "low",
+      "--size", "1024x1024",
+    ], { cwd: root, env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    const payload = parseOneJson(result);
+    assert.equal(payload.status, "success");
+    assert.equal(payload.command, "generate");
+    assert.equal(payload.exit_code, 0);
+    assert.equal(payload.saved.length, 1);
+  });
+  assert.equal(requests, 1);
+});
+
+test("direct edit command accepts repeated image paths and returns strict JSON", async () => {
+  const root = await tempDir();
+  const sourceA = path.join(root, "source A 中文.png");
+  const sourceB = path.join(root, "source B 中文.png");
+  await writeFile(sourceA, Buffer.from(fixturePngBase64, "base64"));
+  await writeFile(sourceB, Buffer.from(fixturePngBase64, "base64"));
+  await withMockImagesApi((request, response, body) => {
+    assert.equal(request.url, "/v1/images/edits");
+    assert.equal((body.toString("latin1").match(/name="image"/g) ?? []).length, 2);
+    assert.match(body.toString("utf8"), /只把围巾改成蓝色/);
+    completed(response, "edit");
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill direct edit");
+    await writeConfig(skillRoot, baseURL);
+    const result = await execFileAsync(process.execPath, [
+      scriptPath,
+      "edit",
+      "--prompt", "只把围巾改成蓝色",
+      "--image", sourceA,
+      "--image", sourceB,
+      "--workspace", path.join(root, "edit workspace"),
+    ], { cwd: root, env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    assert.equal(parseOneJson(result).status, "success");
+  });
 });
 
 test("CLI entrypoint drains the terminal result instead of force-exiting", async () => {
