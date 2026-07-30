@@ -12,11 +12,11 @@ async function main() {
       return;
     }
     const exitCode = await runCli(process.argv.slice(2));
-    // runCli waits for the final stdout write callback. Give a terminal pipe a
-    // brief chance to consume that JSON before force-ending this one-shot CLI;
-    // an upstream proxy or keep-alive socket must not hold it open afterward.
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    process.exit(exitCode);
+    // Do not force-exit after the write callback. Codex's terminal forwarding
+    // can observe a child exit before consuming the final stdout JSON. Let
+    // Node drain stdout and close naturally after the completed payload has
+    // already cancelled the stream.
+    process.exitCode = exitCode;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await new Promise((resolve, reject) => {
@@ -25,8 +25,7 @@ async function main() {
         else resolve();
       });
     });
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 

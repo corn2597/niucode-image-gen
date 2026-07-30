@@ -80,9 +80,28 @@ function parseOneJson(result) {
 test("v2 skill documentation mandates one native stdin request and no status files", async () => {
   const skill = await readFile(path.join(repoRoot, "SKILL.md"), "utf8");
   assert.match(skill, /run --request-stdin/);
+  assert.match(skill, /next tool call one `functions\.exec` call/i);
+  assert.match(skill, /Open the installed `SKILL\.md` exactly once/i);
+  assert.match(skill, /Do not inspect memory, config, the source image/);
+  assert.match(skill, /tools\.write_stdin/);
+  assert.match(skill, /while \(result\.session_id\)/);
+  assert.match(skill, /chars: `\$\{requestJson\}\\n`/);
+  assert.match(skill, /tty: true/);
+  assert.match(skill, /cannot replace `tools\.write_stdin`/i);
+  assert.match(skill, /Script running with cell ID <id>/);
+  assert.match(skill, /functions\.wait/);
+  assert.match(skill, /never answer while either remains active/i);
+  assert.match(skill, /Do not confuse the outer `cell_id` with the nested terminal `session_id`/i);
   assert.match(skill, /does not require stdin EOF/i);
   assert.doesNotMatch(skill, /request-file/i);
   assert.doesNotMatch(skill, /status-file/i);
+});
+
+test("CLI entrypoint drains the terminal result instead of force-exiting", async () => {
+  const entrypoint = await readFile(path.join(repoRoot, "scripts", "niucodes-image-gen.mjs"), "utf8");
+  assert.match(entrypoint, /process\.exitCode = exitCode/);
+  assert.match(entrypoint, /process\.exitCode = 1/);
+  assert.doesNotMatch(entrypoint, /process\.exit\(/);
 });
 
 test("v2 generate preserves Chinese prompt and returns one strict JSON result", async () => {
