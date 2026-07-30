@@ -84,10 +84,17 @@ async function withMockImagesApi(handler, run) {
 }
 
 function complete(response, command) {
-  const type = command === "generate" ? "image_generation.completed" : "image_edit.completed";
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "x-request-id": `packaged-${command}` });
-  // No newline or EOF: package must return from the completed Base64 event.
-  response.write(`data: ${JSON.stringify({ type, b64_json: fixturePngBase64 })}`);
+  // Exercise relay variants seen in production. The stream intentionally has
+  // no trailing newline or EOF, so the native package must return from Base64.
+  if (command === "generate") {
+    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}`);
+    return;
+  }
+  response.write(`event: image_generation.completed\ndata: ${JSON.stringify({
+    event: "image_generation.completed",
+    data: { b64_json: fixturePngBase64 },
+  })}`);
 }
 
 function readResult(result) {
@@ -162,6 +169,7 @@ await withMockImagesApi((request, response, body) => {
   assert.equal(edit.exit_code, 0);
   assert.equal(edit.api_request_id, "packaged-edit");
   assert.equal((await readFile(edit.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
+  assert.equal(edit.timing_ms.stream_completed_frame_terminated, false);
 });
 
 assert.equal(requestCount, 2, "one API request per native invocation");

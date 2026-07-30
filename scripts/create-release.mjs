@@ -15,6 +15,7 @@ if (platformFlagIndex !== -1 && (argv.length !== 2 || platformFlagIndex !== 0)) 
   throw new Error("Usage: node scripts/create-release.mjs [--platform <platform-id>]");
 }
 const requestedPlatform = platformFlagIndex === -1 ? undefined : argv[1];
+const installerFiles = ["install-macos.command", "install-windows.cmd"];
 
 const sharedFiles = [
   "SKILL.md",
@@ -106,6 +107,23 @@ for (const platform of selectedPlatforms) {
 
 const checksums = await Promise.all(archives.map(async (archive) => `${await sha256(archive)}  ${archive}`));
 if (requestedPlatform === undefined) {
-  await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${checksums.join("\n")}\n`);
+  for (const installerFile of installerFiles) {
+    await cp(path.join(root, installerFile), path.join(releaseDir, installerFile));
+  }
+  await chmod(path.join(releaseDir, "install-macos.command"), 0o755);
+  const installerChecksums = await Promise.all(
+    installerFiles.map(async (installerFile) => `${await sha256(installerFile)}  ${installerFile}`),
+  );
+  await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${[...checksums, ...installerChecksums].join("\n")}\n`);
 }
-process.stdout.write(`${JSON.stringify({ status: "success", version, platform: requestedPlatform ?? "all", release_dir: releaseDir, archives })}\n`);
+for (const directoryName of [packageName, ...selectedPlatforms.map((platform) => `${packageName}-${platform.id}`)]) {
+  await rm(path.join(releaseDir, directoryName), { recursive: true, force: true });
+}
+process.stdout.write(`${JSON.stringify({
+  status: "success",
+  version,
+  platform: requestedPlatform ?? "all",
+  release_dir: releaseDir,
+  archives,
+  installers: requestedPlatform === undefined ? installerFiles : [],
+})}\n`);

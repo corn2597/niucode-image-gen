@@ -334,13 +334,18 @@ function createRequestLifecycle(timeoutMs) {
   };
 }
 
-function completedEventType(command) {
-  return command === "generate" ? "image_generation.completed" : "image_edit.completed";
-}
+const COMPLETED_EVENT_TYPES = new Set([
+  "image_generation.completed",
+  "image_edit.completed",
+  "response.output_item.done",
+  "response.completed",
+]);
 
-function partialEventType(command) {
-  return command === "generate" ? "image_generation.partial_image" : "image_edit.partial_image";
-}
+const PARTIAL_EVENT_TYPES = new Set([
+  "image_generation.partial_image",
+  "image_edit.partial_image",
+  "response.image_generation_call.partial_image",
+]);
 
 class ImageHttpError extends Error {
   constructor(message, { status, requestId, code, cause, deliveryUnknown = false, phase } = {}) {
@@ -354,18 +359,85 @@ class ImageHttpError extends Error {
   }
 }
 
-function parseCompletedPayload(payload, expectedCompletedType) {
+function parseJsonPayload(payload) {
   let event;
   try {
     event = JSON.parse(payload);
   } catch {
     return null;
   }
-  if (event?.type !== expectedCompletedType) return null;
-  if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
+
+  return event;
+}
+
+function eventTypeFromPayload(event) {
+  if (!event || typeof event !== "object") return null;
+  for (const value of [event.type, event.event, event.event_type]) {
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return null;
+}
+
+function imageItemsFromPayload(payload) {
+  const items = [];
+  const seen = new Set();
+
+  const visit = (value, inheritedPrompt = null, depth = 0) => {
+    if (depth > 5 || value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, inheritedPrompt, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+
+    const revisedPrompt = typeof value.revised_prompt === "string"
+      ? value.revised_prompt
+      : inheritedPrompt;
+    const base64 = typeof value.b64_json === "string" && value.b64_json.length > 0
+      ? value.b64_json
+      : typeof value.partial_image_b64 === "string" && value.partial_image_b64.length > 0
+        ? value.partial_image_b64
+        : typeof value.result === "string" && value.result.length > 0
+          ? value.result
+        : null;
+    if (base64 && !seen.has(base64)) {
+      seen.add(base64);
+      items.push({ b64_json: base64, revised_prompt: revisedPrompt ?? null });
+    }
+
+    // Limit traversal to known Images/Responses wrapper fields. This accepts
+    // normal JSON and relay envelopes without scanning unrelated metadata.
+    for (const key of ["data", "image", "images", "output", "result", "response"]) {
+      if (value[key] !== undefined) visit(value[key], revisedPrompt, depth + 1);
+    }
+  };
+
+  visit(payload);
+  return items;
+}
+
+function classifyImagePayload(payload, frameEventType) {
+  const event = parseJsonPayload(payload);
+  if (event === null) return { kind: "invalid" };
+
+  const payloadEventType = eventTypeFromPayload(event);
+  const eventTypes = [frameEventType, payloadEventType].filter(Boolean);
+  if (eventTypes.some((type) => PARTIAL_EVENT_TYPES.has(type))) {
+    return { kind: "partial" };
+  }
+
+  const completed = imageItemsFromPayload(event);
+  const hasCompletedMarker = eventTypes.some((type) => COMPLETED_EVENT_TYPES.has(type));
+  if (hasCompletedMarker && completed.length === 0) {
     throw new Error("Image stream completed without image data.");
   }
-  return event;
+  if (completed.length > 0 && (hasCompletedMarker || eventTypes.length === 0)) {
+    return { kind: "completed", completed };
+  }
+  if (payloadEventType && !hasCompletedMarker) {
+    return { kind: "unsupported", eventType: payloadEventType };
+  }
+  return { kind: "other" };
 }
 
 function extractDataPayload(line) {
@@ -378,60 +450,53 @@ async function consumeImageStream(response, invocation, lifecycle) {
 
   const decoder = new TextDecoder("utf-8");
   const reader = response.body.getReader();
-  const expectedCompletedType = completedEventType(invocation.command);
-  const expectedPartialType = partialEventType(invocation.command);
   const dataLines = [];
+  const rawJsonLines = [];
+  let frameEventType = null;
   let pending = "";
   let firstByteMs = null;
   let partialEventCount = 0;
   let byteCount = 0;
 
-  const inspectPayload = (payload, frameTerminated) => {
+  const inspectPayload = (payload, frameTerminated, eventType = frameEventType, { countPartial = true } = {}) => {
     if (!payload || payload === "[DONE]") return null;
-    const completed = parseCompletedPayload(payload, expectedCompletedType);
-    if (completed) {
+    const classified = classifyImagePayload(payload, eventType);
+    if (classified.kind === "completed") {
       return {
-        completed: [{ b64_json: completed.b64_json, revised_prompt: completed.revised_prompt ?? null }],
+        completed: classified.completed,
         firstByteMs,
         completedPayloadMs: Math.round(performance.now()),
         completedFrameTerminated: frameTerminated,
         partialEventCount,
       };
     }
-    try {
-      const event = JSON.parse(payload);
-      if (event?.type === expectedPartialType) {
-        partialEventCount += 1;
-        return null;
-      }
-      if (event?.type) {
-        throw new Error(`Image stream returned an unsupported event: ${String(event.type)}.`);
-      }
-    } catch (error) {
-      if (error instanceof SyntaxError) return null;
-      throw error;
+    if (classified.kind === "partial") {
+      if (countPartial) partialEventCount += 1;
+      return null;
+    }
+    if (classified.kind === "unsupported") {
+      throw new Error(`Image stream returned an unsupported event: ${classified.eventType}.`);
     }
     return null;
   };
 
-  const inspectOpenFrame = () => {
-    const payload = dataLines.join("\n");
+  const inspectOpenFrame = (extraData = null, rawJson = null) => {
+    const payload = rawJson ?? [...dataLines, ...(extraData === null ? [] : [extraData])].join("\n");
     if (!payload || payload === "[DONE]") return null;
-    const completed = parseCompletedPayload(payload, expectedCompletedType);
-    if (!completed) return null;
-    return {
-      completed: [{ b64_json: completed.b64_json, revised_prompt: completed.revised_prompt ?? null }],
-      firstByteMs,
-      completedPayloadMs: Math.round(performance.now()),
-      completedFrameTerminated: false,
-      partialEventCount,
-    };
+    return inspectPayload(payload, false, frameEventType, { countPartial: false });
   };
   const processLine = (line) => {
     if (line === "") {
-      const result = inspectPayload(dataLines.join("\n"), true);
+      const payload = dataLines.length > 0 ? dataLines.join("\n") : rawJsonLines.join("\n");
+      const result = inspectPayload(payload, true);
       dataLines.length = 0;
+      rawJsonLines.length = 0;
+      frameEventType = null;
       return result;
+    }
+    if (line.startsWith("event:")) {
+      frameEventType = line.slice(6).trim() || null;
+      return null;
     }
     const data = extractDataPayload(line);
     if (data !== null) {
@@ -440,6 +505,11 @@ async function consumeImageStream(response, invocation, lifecycle) {
       // append the blank SSE frame delimiter. A valid completed payload is
       // sufficient to persist the final image immediately.
       return inspectOpenFrame();
+    }
+    const trimmed = line.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[") || rawJsonLines.length > 0) {
+      rawJsonLines.push(line);
+      return inspectOpenFrame(null, rawJsonLines.join("\n"));
     }
     return null;
   };
@@ -471,15 +541,19 @@ async function consumeImageStream(response, invocation, lifecycle) {
 
       // Also allow a completed `data:` JSON object that ends exactly at a
       // transport chunk boundary without either an LF or a blank SSE line.
-      const pendingData = extractDataPayload(pending);
-      const completed = pendingData === null
-        ? inspectOpenFrame()
-        : (() => {
-          dataLines.push(pendingData);
-          const result = inspectOpenFrame();
-          dataLines.pop();
-          return result;
-        })();
+      // Avoid repeatedly JSON-parsing an incomplete multi-megabyte Base64
+      // payload on every transport chunk. A complete JSON document must end in
+      // a closing object/array delimiter (ignoring whitespace).
+      const pendingTrimmed = pending.trimEnd();
+      const mayBeCompleteJson = pendingTrimmed.endsWith("}") || pendingTrimmed.endsWith("]");
+      let completed = null;
+      if (mayBeCompleteJson) {
+        const pendingData = extractDataPayload(pending);
+        if (pendingData !== null) completed = inspectOpenFrame(pendingData);
+        else if (pending.trimStart().startsWith("{") || pending.trimStart().startsWith("[")) {
+          completed = inspectOpenFrame(null, [...rawJsonLines, pending].join("\n"));
+        }
+      }
       if (completed) return completed;
     }
 
@@ -488,7 +562,8 @@ async function consumeImageStream(response, invocation, lifecycle) {
       const completed = processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
       if (completed) return completed;
     }
-    const completed = inspectPayload(dataLines.join("\n"), false);
+    const remainingPayload = dataLines.length > 0 ? dataLines.join("\n") : rawJsonLines.join("\n");
+    const completed = inspectPayload(remainingPayload, false);
     if (completed) return completed;
   } finally {
     // A completed Base64 payload is terminal. Do not wait for an upstream

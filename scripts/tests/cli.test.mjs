@@ -272,6 +272,92 @@ test("completed Base64 returns before upstream SSE EOF and closes the socket", a
   assert.equal(clientClosed, true);
 });
 
+for (const variant of [
+  {
+    name: "SSE event line with a data-only Base64 payload",
+    contentType: "text/event-stream",
+    body: `event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}\n\n`,
+  },
+  {
+    name: "nested relay event envelope",
+    contentType: "text/event-stream",
+    body: `data: ${JSON.stringify({ event: "image_generation.completed", data: { b64_json: fixturePngBase64 } })}\n\n`,
+  },
+  {
+    name: "normal Images JSON response",
+    contentType: "application/json",
+    body: JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }),
+  },
+  {
+    name: "Responses completed envelope with result Base64",
+    contentType: "text/event-stream",
+    body: `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", output: [{ type: "image_generation_call", result: fixturePngBase64 }] })}`,
+  },
+]) {
+  test(`completed image returns promptly for ${variant.name}`, async () => {
+    const root = await tempDir();
+    await withMockImagesApi((_request, response) => {
+      response.writeHead(200, { "content-type": variant.contentType });
+      response.write(variant.body);
+    }, async (baseURL) => {
+      const skillRoot = path.join(root, "skill");
+      await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+      const started = Date.now();
+      const result = await runWithStdin({
+        version: 2,
+        command: "generate",
+        workspace: path.join(root, "workspace"),
+        prompt: variant.name,
+      }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+      assert.equal(parseOneJson(result).status, "success");
+      assert.ok(Date.now() - started < 2000, `${variant.name} waited for the open response socket`);
+    });
+  });
+}
+
+test("edit accepts a relay that labels the final image as image_generation.completed", async () => {
+  const root = await tempDir();
+  const source = path.join(root, "source.png");
+  await writeFile(source, Buffer.from(fixturePngBase64, "base64"));
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`data: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    const result = await runWithStdin({
+      version: 2,
+      command: "edit",
+      workspace: path.join(root, "workspace"),
+      prompt: "change one detail",
+      images: [source],
+    }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    assert.equal(parseOneJson(result).status, "success");
+  });
+});
+
+test("partial image does not terminate before the completed image", async () => {
+  const root = await tempDir();
+  const partialBase64 = Buffer.from("not the final image").toString("base64");
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: image_generation.partial_image\ndata: ${JSON.stringify({ b64_json: partialBase64 })}\n\n`);
+    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    const payload = parseOneJson(await runWithStdin({
+      version: 2,
+      command: "generate",
+      workspace: path.join(root, "workspace"),
+      prompt: "wait for final image",
+    }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }));
+    assert.equal(payload.status, "success");
+    assert.equal(payload.timing_ms.stream_partial_events, 1);
+    assert.equal((await readFile(payload.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
+  });
+});
+
 test("timeout uses the configured full deadline and returns a terminal result", async () => {
   const root = await tempDir();
   let clientClosed = false;

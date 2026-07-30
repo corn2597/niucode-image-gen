@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing Git tag to receive the release assets
         required: true
-        default: v1.3.0
+        default: v1.6.3
         type: string
 
 permissions:
@@ -87,6 +87,8 @@ jobs:
             release/niucodes-image-gen-macos-arm64-v*.zip
             release/niucodes-image-gen-macos-x64-v*.zip
             release/niucodes-image-gen-win-x64-v*.zip
+            release/install-macos.command
+            release/install-windows.cmd
             release/SHA256SUMS.txt
           if-no-files-found: error
 
@@ -141,6 +143,8 @@ jobs:
             "release/niucodes-image-gen-macos-arm64-v${version}.zip" \
             "release/niucodes-image-gen-macos-x64-v${version}.zip" \
             "release/niucodes-image-gen-win-x64-v${version}.zip" \
+            release/install-macos.command \
+            release/install-windows.cmd \
             release/SHA256SUMS.txt \
             --clobber
 
@@ -154,6 +158,8 @@ jobs:
             --pattern "niucodes-image-gen-v*.zip" \
             --pattern "niucodes-image-gen-macos-arm64-v*.zip" \
             --pattern "niucodes-image-gen-macos-x64-v*.zip" \
-            --pattern "niucodes-image-gen-win-x64-v*.zip"
+            --pattern "niucodes-image-gen-win-x64-v*.zip" \
+            --pattern "install-macos.command" \
+            --pattern "install-windows.cmd"
           cp release/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
           (cd downloaded-release && sha256sum -c SHA256SUMS.txt)

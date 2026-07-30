@@ -5,6 +5,25 @@ import test from "node:test";
 
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
 
+test("package, plugin, and installer release versions stay synchronized", async () => {
+  const packageMetadata = JSON.parse(await readFile(path.join(repoRoot, "package.json"), "utf8"));
+  const pluginMetadata = JSON.parse(await readFile(path.join(repoRoot, ".codex-plugin", "plugin.json"), "utf8"));
+  const releaseVersion = (await readFile(path.join(repoRoot, "release-version.txt"), "utf8")).trim();
+  assert.equal(pluginMetadata.version, packageMetadata.version);
+  assert.equal(releaseVersion, `v${packageMetadata.version}`);
+});
+
+test("local and CI releases publish both bootstrap installers", async () => {
+  const createRelease = await readFile(path.join(repoRoot, "scripts", "create-release.mjs"), "utf8");
+  const assembleRelease = await readFile(path.join(repoRoot, "scripts", "assemble-release.mjs"), "utf8");
+  const workflow = await readFile(path.join(repoRoot, ".github", "workflows", "publish-release.yml"), "utf8");
+  for (const installer of ["install-macos.command", "install-windows.cmd"]) {
+    assert.match(createRelease, new RegExp(installer.replace(".", "\\.")));
+    assert.match(assembleRelease, new RegExp(installer.replace(".", "\\.")));
+    assert.match(workflow, new RegExp(`release/${installer.replace(".", "\\.")}`));
+  }
+});
+
 test("macOS Gitee bootstrap installer downloads, verifies, installs, and writes the local key", async () => {
   const installer = await readFile(path.join(repoRoot, "install-macos.command"), "utf8");
   assert.match(installer, /api\/v5\/repos\/\$\{REPOSITORY\}\/releases\/latest/);

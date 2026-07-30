@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import archiver from "archiver";
@@ -21,6 +21,7 @@ const stagingDir = path.join(root, ".release-staging");
 const packageName = "niucodes-image-gen";
 const platforms = ["macos-arm64", "macos-x64", "win-x64"];
 const archiveNames = platforms.map((platform) => `${packageName}-${platform}-v${version}.zip`);
+const installerFiles = ["install-macos.command", "install-windows.cmd"];
 
 async function zipDirectory(directoryName, archiveName) {
   await new Promise((resolve, reject) => {
@@ -61,7 +62,13 @@ for (const platform of platforms.slice(1)) {
 const universalArchive = `${packageName}-v${version}.zip`;
 await zipDirectory(packageName, universalArchive);
 const allArchives = [universalArchive, ...archiveNames];
-const checksums = await Promise.all(allArchives.map(async (name) => `${await checksum(name)}  ${name}`));
+for (const installerFile of installerFiles) {
+  await cp(path.join(root, installerFile), path.join(releaseDir, installerFile));
+}
+await chmod(path.join(releaseDir, "install-macos.command"), 0o755);
+const releaseAssets = [...allArchives, ...installerFiles];
+const checksums = await Promise.all(releaseAssets.map(async (name) => `${await checksum(name)}  ${name}`));
 await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${checksums.join("\n")}\n`);
 await rm(stagingDir, { recursive: true, force: true });
-process.stdout.write(`${JSON.stringify({ status: "success", version, release_dir: releaseDir, archives: allArchives })}\n`);
+await rm(universalRoot, { recursive: true, force: true });
+process.stdout.write(`${JSON.stringify({ status: "success", version, release_dir: releaseDir, archives: allArchives, installers: installerFiles })}\n`);
