@@ -63,7 +63,13 @@ if errorlevel 1 (
 )
 
 set "EXPECTED_SHA="
-for /f "tokens=1" %%H in ('findstr /R /C:"^[0-9a-fA-F][0-9a-fA-F]*  *%ARCHIVE_NAME%$" "%CHECKSUM_PATH%"') do set "EXPECTED_SHA=%%H"
+rem Parse the standard SHA256SUMS format by columns instead of using findstr
+rem regular expressions. Windows findstr behaves inconsistently for character
+rem ranges on some localized installations.
+for /f "tokens=1,2" %%H in ('type "%CHECKSUM_PATH%"') do (
+  if /I "%%I"=="%ARCHIVE_NAME%" set "EXPECTED_SHA=%%H"
+  if /I "%%I"=="*%ARCHIVE_NAME%" set "EXPECTED_SHA=%%H"
+)
 set "ACTUAL_SHA="
 for /f "tokens=1" %%H in ('certutil.exe -hashfile "%ARCHIVE_PATH%" SHA256 ^| findstr /R /X "[0-9A-Fa-f][0-9A-Fa-f]*"') do set "ACTUAL_SHA=%%H"
 if not defined EXPECTED_SHA (

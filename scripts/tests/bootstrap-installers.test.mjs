@@ -22,6 +22,10 @@ test("Windows CMD bootstrap installer verifies and installs the current Gitee pa
   assert.match(installer, /release-version\.txt/);
   assert.match(installer, /curl\.exe --fail --location/);
   assert.match(installer, /certutil\.exe -hashfile/);
+  assert.match(installer, /for \/f "tokens=1,2"/i);
+  assert.match(installer, /if \/I "%%I"=="%ARCHIVE_NAME%" set "EXPECTED_SHA=%%H"/);
+  assert.match(installer, /if \/I "%%I"=="\*%ARCHIVE_NAME%" set "EXPECTED_SHA=%%H"/);
+  assert.doesNotMatch(installer, /findstr \/R \/C:.*ARCHIVE_NAME/);
   assert.match(installer, /tar\.exe -xf/);
   assert.match(installer, /--prompt-api-key/);
   assert.doesNotMatch(installer, /[^\x00-\x7F]/);
