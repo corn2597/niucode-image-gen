@@ -157,7 +157,7 @@ jobs:
               --form "target_commitish=$GITHUB_SHA" \
               --form "name=$RELEASE_TAG" \
               --form "body=macOS Intel and Apple Silicon GUI installers" \
-              --form "prerelease=false" | jq -r '.id')"
+              --form "prerelease=true" | jq -r '.id')"
           fi
           test -n "$release_id"
           for asset in release/*; do
@@ -165,6 +165,12 @@ jobs:
               --form "access_token=$GITEE_TOKEN" \
               --form "file=@$asset" >/dev/null
           done
+          curl -fsS -X PATCH "$api/releases/$release_id" \
+            --form "access_token=$GITEE_TOKEN" \
+            --form "tag_name=$RELEASE_TAG" \
+            --form "name=$RELEASE_TAG" \
+            --form "body=macOS Intel and Apple Silicon GUI installers" \
+            --form "prerelease=false" >/dev/null
       - name: Verify Gitee release assets
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
