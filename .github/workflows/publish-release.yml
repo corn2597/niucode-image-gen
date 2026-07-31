@@ -154,6 +154,7 @@ jobs:
             release_id="$(curl -fsS -X POST "$api/releases" \
               --form "access_token=$GITEE_TOKEN" \
               --form "tag_name=$RELEASE_TAG" \
+              --form "target_commitish=$GITHUB_SHA" \
               --form "name=$RELEASE_TAG" \
               --form "body=macOS Intel and Apple Silicon GUI installers" \
               --form "prerelease=false" | jq -r '.id')"
