@@ -20,13 +20,13 @@ async function exists(filePath) {
   try { await stat(filePath); return true; } catch { return false; }
 }
 
-async function findPowerShellScripts(directory) {
+async function findLegacyScripts(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   const found = [];
   for (const entry of entries) {
     const entryPath = path.join(directory, entry.name);
-    if (entry.isDirectory()) found.push(...await findPowerShellScripts(entryPath));
-    else if (entry.name.toLowerCase().endsWith(".ps1")) found.push(entryPath);
+    if (entry.isDirectory()) found.push(...await findLegacyScripts(entryPath));
+    else if ([".ps1", ".cmd", ".command"].some((suffix) => entry.name.toLowerCase().endsWith(suffix))) found.push(entryPath);
   }
   return found;
 }
@@ -37,17 +37,15 @@ async function assertRuntimeOnlyPackage(directory) {
   for (const entry of entries) {
     assert.ok(allowedRootEntries.has(entry.name), `Release package contains a non-runtime entry: ${entry.name}`);
   }
-  assert.deepEqual(await findPowerShellScripts(directory), [], "Release package must not contain a PowerShell runner.");
+  assert.deepEqual(await findLegacyScripts(directory), [], "Release package must not contain a legacy script runner.");
   assert.equal(await exists(path.join(directory, "scripts")), false, "Release package must not contain source scripts.");
   assert.equal(await exists(path.join(directory, "node_modules")), false, "Release package must not contain Node dependencies.");
 }
 
 function executableFor(packageRoot) {
-  const files = process.platform === "win32"
-    ? ["niucodes-image-gen-win-x64.exe"]
-    : process.arch === "arm64"
-      ? ["niucodes-image-gen-macos-arm64", "niucodes-image-gen-macos-x64"]
-      : ["niucodes-image-gen-macos-x64", "niucodes-image-gen-macos-arm64"];
+  const files = process.arch === "arm64"
+    ? ["niucodes-image-gen-macos-arm64", "niucodes-image-gen-macos-x64"]
+    : ["niucodes-image-gen-macos-x64", "niucodes-image-gen-macos-arm64"];
   const override = process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE;
   if (override) return path.resolve(override);
   return path.join(packageRoot, "bin", files[0]);
@@ -55,7 +53,6 @@ function executableFor(packageRoot) {
 
 async function runNative(executable, command, args) {
   return execFileAsync(executable, [command, ...args], {
-    windowsHide: true,
     timeout: 15000,
     maxBuffer: 4 * 1024 * 1024,
   });

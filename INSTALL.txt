@@ -1,16 +1,13 @@
-NiuCodes Image Gen installation
+NiuCodes Image Gen installation for macOS
 
-Install from the current Gitee release with the repository bootstrap script.
-The script asks for the API key without displaying it, verifies the release SHA-256,
-installs into Codex, then writes config.json. It does not call the image API.
+Download the DMG for your Mac from the latest Gitee release:
+  Apple Silicon: niucodes-image-gen-installer-macos-arm64-v*.dmg
+  Intel:         niucodes-image-gen-installer-macos-x64-v*.dmg
 
-macOS:
-  curl -fL https://gitee.com/niucodes/niucode-image-gen/raw/main/install-macos.command -o install-macos.command
-  chmod +x install-macos.command && ./install-macos.command
+Open the DMG, launch NiuCodes Image Gen Installer, enter the API Key, and click Install.
+The installer downloads the matching package from the latest Gitee release, verifies
+its SHA-256 checksum, installs it into Codex, and writes config.json. It does not call
+the image API during installation.
 
-Windows:
-  Download https://gitee.com/niucodes/niucode-image-gen/raw/main/install-windows.cmd
-  Double-click install-windows.cmd
-
-No Node.js, Python, OpenAI SDK, or administrator permission is required.
+No terminal, Node.js, Python, OpenAI SDK, or administrator permission is required.
 Restart Codex Desktop after installation.

@@ -238,7 +238,7 @@ function writeStderr(value) {
 }
 
 function parseRequestJson(contents, requestSource) {
-  // Windows PowerShell 5.1 commonly writes UTF-8 JSON with a BOM.
+  // Accept a UTF-8 BOM from compatibility callers.
   const json = contents.charCodeAt(0) === 0xfeff ? contents.slice(1) : contents;
   try {
     return JSON.parse(json);

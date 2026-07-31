@@ -4,35 +4,28 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing Git tag to receive the release assets
+        description: Release tag
         required: true
-        default: v1.6.4
+        default: v1.7.0
         type: string
 
 permissions:
   contents: write
 
 jobs:
-  packaged-e2e:
-    name: ${{ matrix.id }} release package verification
+  build:
+    name: ${{ matrix.id }} release assets
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: windows-x64
-            runner: windows-latest
-            archive_id: win-x64
-            package_dir: niucodes-image-gen-win-x64
-            build_script: build:package:win-x64
           - id: macos-arm64
             runner: macos-14
-            archive_id: macos-arm64
             package_dir: niucodes-image-gen-macos-arm64
             build_script: build:package:macos-arm64
           - id: macos-x64
             runner: macos-15-intel
-            archive_id: macos-x64
             package_dir: niucodes-image-gen-macos-x64
             build_script: build:package:macos-x64
     steps:
@@ -43,123 +36,141 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npm run ${{ matrix.build_script }}
-      - name: Unpack and test the platform release ZIP
-        shell: pwsh
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
-          $version = (node -p "require('./package.json').version")
-          $archive = "release/niucodes-image-gen-${{ matrix.archive_id }}-v$version.zip"
-          $destination = Join-Path $env:RUNNER_TEMP "niucodes-image-gen release verification"
-          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
-          node scripts/tests/packaged-e2e.mjs --package-root (Join-Path $destination "${{ matrix.package_dir }}")
-      - name: Upload verified platform package
+          if [ -z "$CERTIFICATE_P12" ]; then
+            echo "Developer ID certificate not configured; building an ad-hoc signed DMG."
+            exit 0
+          fi
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/niucodes-signing.keychain-db"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p runner "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p runner "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k runner "$keychain"
+
+      - name: Build package and notarized DMG
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: npm run ${{ matrix.build_script }}
+
+      - name: Verify package and DMG
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          destination="$RUNNER_TEMP/niucodes-image-gen-package"
+          mount="$RUNNER_TEMP/niucodes-image-gen-dmg"
+          mkdir -p "$destination" "$mount"
+          ditto -x -k "release/niucodes-image-gen-${{ matrix.id }}-v${version}.zip" "$destination"
+          node scripts/tests/packaged-e2e.mjs --package-root "$destination/${{ matrix.package_dir }}"
+          hdiutil attach "release/niucodes-image-gen-installer-${{ matrix.id }}-v${version}.dmg" -nobrowse -readonly -mountpoint "$mount"
+          codesign --verify --deep --strict "$mount/NiuCodes Image Gen Installer.app"
+          hdiutil detach "$mount"
+
+      - name: Upload verified assets
         uses: actions/upload-artifact@v4
         with:
           name: niucodes-image-gen-${{ matrix.id }}
-          path: release/niucodes-image-gen-${{ matrix.archive_id }}-v*.zip
-          if-no-files-found: error
-
-  assemble-release:
-    needs: packaged-e2e
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: verified-packages
-          merge-multiple: true
-
-      - run: npm ci
-      - run: npm run assemble:release -- --input-dir verified-packages
-
-      - name: Upload assembled release assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: niucodes-image-gen-release-assets
           path: |
-            release/niucodes-image-gen-v*.zip
-            release/niucodes-image-gen-macos-arm64-v*.zip
-            release/niucodes-image-gen-macos-x64-v*.zip
-            release/niucodes-image-gen-win-x64-v*.zip
-            release/install-macos.command
-            release/install-windows.cmd
-            release/SHA256SUMS.txt
+            release/niucodes-image-gen-${{ matrix.id }}-v*.zip
+            release/niucodes-image-gen-installer-${{ matrix.id }}-v*.dmg
           if-no-files-found: error
 
-  universal-windows-e2e:
-    needs: assemble-release
-    runs-on: windows-latest
+  assemble:
+    needs: build
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
       - uses: actions/download-artifact@v4
         with:
+          path: verified-assets
+          merge-multiple: true
+      - run: npm ci
+      - run: npm run assemble:release -- --input-dir verified-assets
+      - name: Verify checksums
+        run: cd release && sha256sum -c SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
           name: niucodes-image-gen-release-assets
-          path: release-assets
-      - name: Unpack and test the final universal ZIP directly
-        shell: pwsh
-        run: |
-          $version = (node -p "require('./package.json').version")
-          $archive = "release-assets/niucodes-image-gen-v$version.zip"
-          $destination = Join-Path $env:RUNNER_TEMP "niucodes-image-gen final universal E2E"
-          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
-          node scripts/tests/packaged-e2e.mjs --package-root (Join-Path $destination "niucodes-image-gen")
+          path: release/
+          if-no-files-found: error
 
-  publish:
-    needs: universal-windows-e2e
+  publish-github:
+    needs: assemble
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: niucodes-image-gen-release-assets
           path: release
-
-      - name: Upload release assets
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="${{ inputs.tag }}"
-          version="${version#v}"
           if ! gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
-            gh release create "${{ inputs.tag }}" \
-              --target "${GITHUB_SHA}" \
-              --title "${{ inputs.tag }}" \
-              --generate-notes
+            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --title "${{ inputs.tag }}" --generate-notes
           fi
-          gh release upload "${{ inputs.tag }}" \
-            "release/niucodes-image-gen-v${version}.zip" \
-            "release/niucodes-image-gen-macos-arm64-v${version}.zip" \
-            "release/niucodes-image-gen-macos-x64-v${version}.zip" \
-            "release/niucodes-image-gen-win-x64-v${version}.zip" \
-            release/install-macos.command \
-            release/install-windows.cmd \
-            release/SHA256SUMS.txt \
-            --clobber
-
-      - name: Verify uploaded release assets
+          gh release upload "${{ inputs.tag }}" release/* --clobber
+      - name: Verify GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir downloaded-release
-          gh release download "${{ inputs.tag }}" \
-            --dir downloaded-release \
-            --pattern "niucodes-image-gen-v*.zip" \
-            --pattern "niucodes-image-gen-macos-arm64-v*.zip" \
-            --pattern "niucodes-image-gen-macos-x64-v*.zip" \
-            --pattern "niucodes-image-gen-win-x64-v*.zip" \
-            --pattern "install-macos.command" \
-            --pattern "install-windows.cmd"
-          cp release/SHA256SUMS.txt downloaded-release/SHA256SUMS.txt
-          (cd downloaded-release && sha256sum -c SHA256SUMS.txt)
+          mkdir downloaded
+          gh release download "${{ inputs.tag }}" --dir downloaded
+          cd downloaded
+          sha256sum -c SHA256SUMS.txt
+
+  publish-gitee:
+    needs: assemble
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: niucodes-image-gen-release-assets
+          path: release
+      - name: Publish Gitee release
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test -n "$GITEE_TOKEN"
+          api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
+          release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
+          if [ -z "$release_id" ]; then
+            release_id="$(curl -fsS -X POST "$api/releases" \
+              --form "access_token=$GITEE_TOKEN" \
+              --form "tag_name=$RELEASE_TAG" \
+              --form "name=$RELEASE_TAG" \
+              --form "body=macOS Intel and Apple Silicon GUI installers" \
+              --form "prerelease=false" | jq -r '.id')"
+          fi
+          test -n "$release_id"
+          for asset in release/*; do
+            curl -fsS -X POST "$api/releases/$release_id/attach_files" \
+              --form "access_token=$GITEE_TOKEN" \
+              --form "file=@$asset" >/dev/null
+          done
+      - name: Verify Gitee release assets
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
+          curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" > release.json
+          for asset in release/*; do
+            jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' release.json >/dev/null
+          done

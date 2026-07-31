@@ -7,13 +7,10 @@ tmp/
 *.local.json
 .DS_Store
 release/*.zip
+release/*.dmg
 release/niucodes-image-gen/
 release/niucodes-image-gen-macos-arm64/
 release/niucodes-image-gen-macos-x64/
-release/niucodes-image-gen-win-x64/
-release/install-macos.command
-release/install-windows.cmd
 bin/niucodes-image-gen-installer-*
 bin/niucodes-image-gen-macos-arm64
 bin/niucodes-image-gen-macos-x64
-bin/niucodes-image-gen-win-x64.exe

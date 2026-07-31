@@ -26,7 +26,6 @@ async function runWithStdin(request, { env = process.env, cwd = repoRoot, keepSt
       cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
     });
     const stdout = [];
     const stderr = [];
@@ -94,7 +93,7 @@ test("skill documentation uses direct native commands and preserves nested termi
   assert.match(skill, /direct `shell_command`-style tool/);
   assert.match(skill, /Never call `tools\.exec_command` or `tools\.write_stdin` when those functions are not exposed/);
   assert.match(skill, /client_request_id/);
-  assert.match(skill, /Do not create a PowerShell\/Bash\/CMD wrapper/i);
+  assert.match(skill, /Do not create a shell wrapper/i);
   assert.doesNotMatch(skill, /request-file/i);
   assert.doesNotMatch(skill, /status-file/i);
   assert.match(agentMetadata, /\$niucodes-image-gen/);
@@ -198,7 +197,7 @@ test("v2 generate preserves Chinese prompt and returns one strict JSON result", 
   assert.equal(requests, 1);
 });
 
-test("v2 edit uploads multiple absolute input images without PowerShell argument parsing", async () => {
+test("v2 edit uploads multiple absolute input images without shell argument parsing", async () => {
   const root = await tempDir();
   const sourceA = path.join(root, "输入 图片 A.png");
   const sourceB = path.join(root, "输入 图片 B.png");
@@ -516,16 +515,8 @@ test("missing workspace uses Pictures first and persistent application data as a
     "/Users/example/Pictures/niucodes-image-gen",
   );
   assert.equal(
-    legacyPicturesOutputDirectory({ home: "C:\\Users\\example", platform: "win32" }),
-    "C:\\Users\\example\\Pictures\\niucodes-image-gen",
-  );
-  assert.equal(
     defaultOutputDirectory({ home: "/Users/example", platform: "darwin" }),
     "/Users/example/Library/Application Support/niucodes-image-gen/outputs",
-  );
-  assert.equal(
-    defaultOutputDirectory({ home: "C:\\Users\\example", platform: "win32", env: { LOCALAPPDATA: "C:\\Users\\example\\AppData\\Local" } }),
-    "C:\\Users\\example\\AppData\\Local\\niucodes-image-gen\\outputs",
   );
   assert.equal(
     defaultOutputDirectory({ home: "/home/example", platform: "linux", env: {} }),

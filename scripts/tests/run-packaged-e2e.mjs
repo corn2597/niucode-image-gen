@@ -10,7 +10,6 @@ const execFileAsync = promisify(execFile);
 function packageDirectory() {
   if (process.platform === "darwin" && process.arch === "arm64") return "niucodes-image-gen-macos-arm64";
   if (process.platform === "darwin" && process.arch === "x64") return "niucodes-image-gen-macos-x64";
-  if (process.platform === "win32" && process.arch === "x64") return "niucodes-image-gen-win-x64";
   throw new Error(`Unsupported packaged E2E platform: ${process.platform}-${process.arch}`);
 }
 
@@ -20,7 +19,7 @@ const archiveName = (await readdir(releaseDir)).find((name) => name.startsWith(`
 if (!archiveName) throw new Error(`Release archive was not found for ${directoryName}.`);
 
 const extractRoot = await mkdtemp(path.join(os.tmpdir(), "niucodes packaged archive "));
-await execFileAsync(process.platform === "win32" ? "tar.exe" : "tar", [
+await execFileAsync("tar", [
   "-xf",
   path.join(releaseDir, archiveName),
   "-C",

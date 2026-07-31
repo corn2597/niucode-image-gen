@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { cp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import archiver from "archiver";
 import path from "node:path";
@@ -7,16 +7,14 @@ import path from "node:path";
 const root = path.resolve(".");
 const releaseDir = path.join(root, "release");
 const packageName = "niucodes-image-gen";
-const packageMetadata = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
-const version = packageMetadata.version;
+const metadata = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
+const version = metadata.version;
 const argv = process.argv.slice(2);
 const platformFlagIndex = argv.indexOf("--platform");
 if (platformFlagIndex !== -1 && (argv.length !== 2 || platformFlagIndex !== 0)) {
   throw new Error("Usage: node scripts/create-release.mjs [--platform <platform-id>]");
 }
 const requestedPlatform = platformFlagIndex === -1 ? undefined : argv[1];
-const installerFiles = ["install-macos.command", "install-windows.cmd"];
-
 const sharedFiles = [
   "SKILL.md",
   "config.json",
@@ -24,46 +22,19 @@ const sharedFiles = [
   path.join(".codex-plugin", "plugin.json"),
   "INSTALL.txt",
 ];
-
 const platforms = [
-  {
-    id: "macos-arm64",
-    binary: "niucodes-image-gen-macos-arm64",
-  },
-  {
-    id: "macos-x64",
-    binary: "niucodes-image-gen-macos-x64",
-  },
-  {
-    id: "win-x64",
-    binary: "niucodes-image-gen-win-x64.exe",
-  },
+  { id: "macos-arm64", binary: "niucodes-image-gen-macos-arm64" },
+  { id: "macos-x64", binary: "niucodes-image-gen-macos-x64" },
 ];
-
 const selectedPlatforms = requestedPlatform === undefined
   ? platforms
   : platforms.filter((platform) => platform.id === requestedPlatform);
-if (selectedPlatforms.length === 0) {
-  throw new Error(`Unsupported release platform: ${requestedPlatform}`);
-}
+if (selectedPlatforms.length === 0) throw new Error(`Unsupported release platform: ${requestedPlatform}`);
 
 async function copyFile(relativePath, destinationRoot) {
-  const source = path.join(root, relativePath);
   const destination = path.join(destinationRoot, relativePath);
   await mkdir(path.dirname(destination), { recursive: true });
-  await cp(source, destination);
-}
-
-async function makePackage(destinationRoot, selectedPlatforms) {
-  for (const relativePath of sharedFiles) {
-    await copyFile(relativePath, destinationRoot);
-  }
-  for (const platform of selectedPlatforms) {
-    await copyFile(path.join("bin", platform.binary), destinationRoot);
-    if (platform.id.startsWith("macos")) {
-      await chmod(path.join(destinationRoot, "bin", platform.binary), 0o755);
-    }
-  }
+  await cp(path.join(root, relativePath), destination);
 }
 
 async function zipDirectory(directoryName, archiveName) {
@@ -79,51 +50,28 @@ async function zipDirectory(directoryName, archiveName) {
   });
 }
 
-async function sha256(fileName) {
-  const bytes = await readFile(path.join(releaseDir, fileName));
-  return createHash("sha256").update(bytes).digest("hex");
+async function writeChecksums() {
+  const assets = (await readdir(releaseDir)).filter((name) => name.endsWith(".zip") || name.endsWith(".dmg")).sort();
+  const checksums = await Promise.all(assets.map(async (name) => {
+    const bytes = await readFile(path.join(releaseDir, name));
+    return `${createHash("sha256").update(bytes).digest("hex")}  ${name}`;
+  }));
+  await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${checksums.join("\n")}\n`);
 }
 
 await rm(releaseDir, { recursive: true, force: true });
 await mkdir(releaseDir, { recursive: true });
-
 const archives = [];
-if (requestedPlatform === undefined) {
-  const fullDirectory = path.join(releaseDir, packageName);
-  await makePackage(fullDirectory, platforms);
-  const fullArchive = `${packageName}-v${version}.zip`;
-  await zipDirectory(packageName, fullArchive);
-  archives.push(fullArchive);
-}
-
 for (const platform of selectedPlatforms) {
   const directoryName = `${packageName}-${platform.id}`;
   const destination = path.join(releaseDir, directoryName);
-  await makePackage(destination, [platform]);
+  for (const relativePath of sharedFiles) await copyFile(relativePath, destination);
+  await copyFile(path.join("bin", platform.binary), destination);
+  await chmod(path.join(destination, "bin", platform.binary), 0o755);
   const archiveName = `${directoryName}-v${version}.zip`;
   await zipDirectory(directoryName, archiveName);
   archives.push(archiveName);
+  await rm(destination, { recursive: true, force: true });
 }
-
-const checksums = await Promise.all(archives.map(async (archive) => `${await sha256(archive)}  ${archive}`));
-if (requestedPlatform === undefined) {
-  for (const installerFile of installerFiles) {
-    await cp(path.join(root, installerFile), path.join(releaseDir, installerFile));
-  }
-  await chmod(path.join(releaseDir, "install-macos.command"), 0o755);
-  const installerChecksums = await Promise.all(
-    installerFiles.map(async (installerFile) => `${await sha256(installerFile)}  ${installerFile}`),
-  );
-  await writeFile(path.join(releaseDir, "SHA256SUMS.txt"), `${[...checksums, ...installerChecksums].join("\n")}\n`);
-}
-for (const directoryName of [packageName, ...selectedPlatforms.map((platform) => `${packageName}-${platform.id}`)]) {
-  await rm(path.join(releaseDir, directoryName), { recursive: true, force: true });
-}
-process.stdout.write(`${JSON.stringify({
-  status: "success",
-  version,
-  platform: requestedPlatform ?? "all",
-  release_dir: releaseDir,
-  archives,
-  installers: requestedPlatform === undefined ? installerFiles : [],
-})}\n`);
+await writeChecksums();
+process.stdout.write(`${JSON.stringify({ status: "success", version, platform: requestedPlatform ?? "all", release_dir: releaseDir, archives })}\n`);

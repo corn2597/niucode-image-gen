@@ -13,7 +13,6 @@ const LEGACY_SERVER_NAME = "niucodes_image_gen";
 export function selectPlatformBinary({ platform = process.platform, arch = process.arch, skillRoot } = {}) {
   if (platform === "darwin" && arch === "arm64") return path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64");
   if (platform === "darwin" && arch === "x64") return path.join(skillRoot, "bin", "niucodes-image-gen-macos-x64");
-  if (platform === "win32" && arch === "x64") return path.join(skillRoot, "bin", "niucodes-image-gen-win-x64.exe");
   throw new Error(`Unsupported platform: ${platform}-${arch}`);
 }
 
@@ -233,7 +232,7 @@ function promptForApiKey() {
 
 async function removeLegacyRunners(installDir) {
   // Installed skills are native-only. Remove the entire legacy directory so a
-  // previous PowerShell or shell runner cannot survive an in-place upgrade.
+  // previous shell runner cannot survive an in-place upgrade.
   await rm(path.join(installDir, "scripts"), { recursive: true, force: true });
 }
 

@@ -131,19 +131,14 @@ export function defaultOutputDirectory({
 } = {}) {
   // This directory is persistent user application data, not a system temp
   // directory. It is the most reliable fallback when Codex has no workspace.
-  const platformPath = platform === "win32" ? path.win32 : path.posix;
-  if (platform === "win32") {
-    return platformPath.join(env.LOCALAPPDATA || platformPath.join(home, "AppData", "Local"), "niucodes-image-gen", "outputs");
-  }
   if (platform === "darwin") {
-    return platformPath.join(home, "Library", "Application Support", "niucodes-image-gen", "outputs");
+    return path.posix.join(home, "Library", "Application Support", "niucodes-image-gen", "outputs");
   }
-  return platformPath.join(env.XDG_DATA_HOME || platformPath.join(home, ".local", "share"), "niucodes-image-gen", "outputs");
+  return path.posix.join(env.XDG_DATA_HOME || path.posix.join(home, ".local", "share"), "niucodes-image-gen", "outputs");
 }
 
 export function legacyPicturesOutputDirectory({ home = os.homedir(), platform = process.platform } = {}) {
-  const platformPath = platform === "win32" ? path.win32 : path.posix;
-  return platformPath.join(home, "Pictures", "niucodes-image-gen");
+  return path.posix.join(home, "Pictures", "niucodes-image-gen");
 }
 
 async function canonicalPath(value) {
@@ -158,12 +153,6 @@ function systemTemporaryRoots(platform = process.platform, env = process.env) {
   const roots = [os.tmpdir(), env.TMPDIR, env.TMP, env.TEMP].filter(Boolean);
   if (platform === "darwin") roots.push("/tmp", "/private/tmp", "/var/folders", "/private/var/folders");
   if (platform === "linux") roots.push("/tmp", "/var/tmp");
-  if (platform === "win32") {
-    roots.push(
-      env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Temp"),
-      env.SystemRoot && path.join(env.SystemRoot, "Temp"),
-    );
-  }
   return [...new Set(roots.filter(Boolean).map((root) => path.resolve(root)))];
 }
 
@@ -596,8 +585,7 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     appendUniquePath(outputCandidates, await taskOutputDirectory(cwd, skillRoot), cwd);
     appendUniquePath(outputCandidates, configuredOutput, cwd);
     // Prefer a visible, user-owned directory when Codex has no workspace.
-    // Controlled Folder Access can deny Pictures on Windows, so the durable
-    // application-data directory remains the final non-temp fallback.
+    // The application-data directory remains the final non-temp fallback.
     appendUniquePath(outputCandidates, legacyPicturesOutputDirectory(), cwd);
     appendUniquePath(outputCandidates, defaultOutputDirectory(), cwd);
   }
