@@ -164,10 +164,13 @@ jobs:
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
-          test -n "$GITEE_TOKEN"
           RELEASE_TAG="${{ inputs.tag }}"
           if [ -z "$RELEASE_TAG" ]; then
             RELEASE_TAG="$(cat release-version.txt)"
+          fi
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "GITEE_TOKEN is not configured; the verification step must find an existing public release."
+            exit 0
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
@@ -201,7 +204,12 @@ jobs:
             RELEASE_TAG="$(cat release-version.txt)"
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
-          curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" > release.json
+          if [ -n "$GITEE_TOKEN" ]; then
+            curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" > release.json
+          else
+            curl -fsS "$api/releases/tags/$RELEASE_TAG" > release.json
+          fi
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .prerelease == false' release.json >/dev/null
           for asset in release/*; do
             jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' release.json >/dev/null
           done
