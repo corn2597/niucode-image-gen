@@ -3,6 +3,9 @@
   "baseURL": "https://api-direct.claudecodes.org/v1",
   "model": "gpt-image-2",
   "timeoutMs": 600000,
+  "waitingHeadersTimeoutMs": 300000,
+  "waitingCompletedTimeoutMs": 120000,
+  "cleanupTimeoutMs": 2000,
   "proxyUrl": "",
   "defaultOutputDir": ""
 }

@@ -10,7 +10,12 @@ export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
 export const DEFAULT_TIMEOUT_MS = 600000;
+export const DEFAULT_WAITING_HEADERS_TIMEOUT_MS = 300000;
+export const DEFAULT_WAITING_COMPLETED_TIMEOUT_MS = 120000;
+export const DEFAULT_CLEANUP_TIMEOUT_MS = 2000;
 const MAX_STREAM_BYTES = 100 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
+const ERROR_BODY_TIMEOUT_MS = 2000;
 const MAX_INPUT_IMAGES = 8;
 const MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024;
@@ -284,19 +289,26 @@ function createRequestLifecycle(timeoutMs) {
   const controller = new AbortController();
   let abortMessage = null;
   let abortCode = null;
+  let abortPhase = null;
   let abortListener = null;
+  let phaseTimeout = null;
 
-  const abort = (message, code = "request_cancelled") => {
+  const abort = (message, code = "request_cancelled", phase = "cancelled") => {
     if (abortMessage) return;
     abortMessage = message;
     abortCode = code;
+    abortPhase = phase;
     controller.abort();
     abortListener?.();
   };
-  const onSignal = (signalName) => abort(`Image request cancelled by ${signalName}.`);
+  const clearPhaseTimeout = () => {
+    clearTimeout(phaseTimeout);
+    phaseTimeout = null;
+  };
+  const onSignal = (signalName) => abort(`Image request cancelled by ${signalName}.`, "request_cancelled", "cancelled");
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
-  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`, "timeout"), timeoutMs);
+  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`, "timeout", "request_total"), timeoutMs);
 
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
@@ -307,15 +319,23 @@ function createRequestLifecycle(timeoutMs) {
       abortListener = listener;
       if (abortMessage) listener();
     },
+    armPhaseTimeout(timeoutMsForPhase, code, message, phase) {
+      clearPhaseTimeout();
+      const boundedMs = Math.min(timeoutMs, timeoutMsForPhase);
+      phaseTimeout = setTimeout(() => abort(message, code, phase), boundedMs);
+    },
+    clearPhaseTimeout,
     throwIfAborted() {
       if (abortMessage) {
         const error = new Error(abortMessage);
         error.code = abortCode ?? "request_cancelled";
+        error.phase = abortPhase ?? "cancelled";
         throw error;
       }
     },
     dispose() {
       clearTimeout(timeout);
+      clearPhaseTimeout();
       process.removeListener("SIGINT", onSigint);
       process.removeListener("SIGTERM", onSigterm);
       abortListener = null;
@@ -323,18 +343,16 @@ function createRequestLifecycle(timeoutMs) {
   };
 }
 
-const COMPLETED_EVENT_TYPES = new Set([
-  "image_generation.completed",
-  "image_edit.completed",
-  "response.output_item.done",
-  "response.completed",
-]);
-
-const PARTIAL_EVENT_TYPES = new Set([
-  "image_generation.partial_image",
-  "image_edit.partial_image",
-  "response.image_generation_call.partial_image",
-]);
+const EVENT_TYPES_BY_COMMAND = {
+  generate: {
+    partial: "image_generation.partial_image",
+    completed: "image_generation.completed",
+  },
+  edit: {
+    partial: "image_edit.partial_image",
+    completed: "image_edit.completed",
+  },
+};
 
 class ImageHttpError extends Error {
   constructor(message, { status, requestId, code, cause, deliveryUnknown = false, phase } = {}) {
@@ -359,74 +377,41 @@ function parseJsonPayload(payload) {
   return event;
 }
 
-function eventTypeFromPayload(event) {
-  if (!event || typeof event !== "object") return null;
-  for (const value of [event.type, event.event, event.event_type]) {
-    if (typeof value === "string" && value.trim() !== "") return value.trim();
-  }
-  return null;
+function protocolError(message, code, eventType) {
+  const error = new Error(message);
+  error.code = code;
+  error.phase = "response_incomplete";
+  if (eventType) error.event_type = eventType;
+  return error;
 }
 
-function imageItemsFromPayload(payload) {
-  const items = [];
-  const seen = new Set();
-
-  const visit = (value, inheritedPrompt = null, depth = 0) => {
-    if (depth > 5 || value === null || value === undefined) return;
-    if (Array.isArray(value)) {
-      for (const item of value) visit(item, inheritedPrompt, depth + 1);
-      return;
-    }
-    if (typeof value !== "object") return;
-
-    const revisedPrompt = typeof value.revised_prompt === "string"
-      ? value.revised_prompt
-      : inheritedPrompt;
-    const base64 = typeof value.b64_json === "string" && value.b64_json.length > 0
-      ? value.b64_json
-      : typeof value.partial_image_b64 === "string" && value.partial_image_b64.length > 0
-        ? value.partial_image_b64
-        : typeof value.result === "string" && value.result.length > 0
-          ? value.result
-        : null;
-    if (base64 && !seen.has(base64)) {
-      seen.add(base64);
-      items.push({ b64_json: base64, revised_prompt: revisedPrompt ?? null });
-    }
-
-    // Limit traversal to known Images/Responses wrapper fields. This accepts
-    // normal JSON and relay envelopes without scanning unrelated metadata.
-    for (const key of ["data", "image", "images", "output", "result", "response"]) {
-      if (value[key] !== undefined) visit(value[key], revisedPrompt, depth + 1);
-    }
-  };
-
-  visit(payload);
-  return items;
-}
-
-function classifyImagePayload(payload, frameEventType) {
+function classifyImageFrame(payload, frameEventType, command) {
   const event = parseJsonPayload(payload);
-  if (event === null) return { kind: "invalid" };
-
-  const payloadEventType = eventTypeFromPayload(event);
-  const eventTypes = [frameEventType, payloadEventType].filter(Boolean);
-  if (eventTypes.some((type) => PARTIAL_EVENT_TYPES.has(type))) {
-    return { kind: "partial" };
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    throw protocolError("Image stream returned invalid JSON data.", "invalid_sse_payload");
   }
-
-  const completed = imageItemsFromPayload(event);
-  const hasCompletedMarker = eventTypes.some((type) => COMPLETED_EVENT_TYPES.has(type));
-  if (hasCompletedMarker && completed.length === 0) {
-    throw new Error("Image stream completed without image data.");
+  const payloadEventType = typeof event.type === "string" ? event.type.trim() : "";
+  if (!frameEventType || !payloadEventType || frameEventType !== payloadEventType) {
+    throw protocolError("Image stream event field does not match JSON type.", "unexpected_event", frameEventType || payloadEventType);
   }
-  if (completed.length > 0 && (hasCompletedMarker || eventTypes.length === 0)) {
-    return { kind: "completed", completed };
+  const expected = EVENT_TYPES_BY_COMMAND[command];
+  if (frameEventType === expected.partial) {
+    if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
+      throw protocolError("Image partial event did not contain b64_json.", "invalid_partial_payload", frameEventType);
+    }
+    return { kind: "partial", eventType: frameEventType };
   }
-  if (payloadEventType && !hasCompletedMarker) {
-    return { kind: "unsupported", eventType: payloadEventType };
+  if (frameEventType === expected.completed) {
+    if (typeof event.b64_json !== "string" || event.b64_json.length === 0) {
+      throw protocolError("Image completed event did not contain b64_json.", "invalid_completed_payload", frameEventType);
+    }
+    return {
+      kind: "completed",
+      eventType: frameEventType,
+      completed: [{ b64_json: event.b64_json, revised_prompt: typeof event.revised_prompt === "string" ? event.revised_prompt : null }],
+    };
   }
-  return { kind: "other" };
+  throw protocolError(`Image stream returned an unexpected event: ${frameEventType}.`, "unexpected_event", frameEventType);
 }
 
 function extractDataPayload(line) {
@@ -434,52 +419,82 @@ function extractDataPayload(line) {
   return line.slice(5).replace(/^ /, "");
 }
 
-async function consumeImageStream(response, invocation, lifecycle) {
+async function settleWithin(promise, timeoutMs) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+  });
+  try {
+    return await Promise.race([Promise.resolve(promise).then(() => true, () => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function consumeImageStream(response, invocation, lifecycle, onProgress) {
   if (!response.body) throw new ImageHttpError("Image API returned an empty response body.", { status: response.status });
 
   const decoder = new TextDecoder("utf-8");
   const reader = response.body.getReader();
   const dataLines = [];
-  const rawJsonLines = [];
   let frameEventType = null;
   let pending = "";
   let firstByteMs = null;
   let partialEventCount = 0;
   let byteCount = 0;
+  let eventCount = 0;
+  let lastEventType = null;
 
-  const inspectPayload = (payload, frameTerminated, eventType = frameEventType, { countPartial = true } = {}) => {
-    if (!payload || payload === "[DONE]") return null;
-    const classified = classifyImagePayload(payload, eventType);
+  const inspectFrame = async (payload, frameTerminated) => {
+    if (!payload || !frameEventType) {
+      throw protocolError("Image stream returned an incomplete SSE frame.", "invalid_sse_frame", frameEventType);
+    }
+    const classified = classifyImageFrame(payload, frameEventType, invocation.command);
+    eventCount += 1;
+    lastEventType = classified.eventType;
     if (classified.kind === "completed") {
+      if (partialEventCount !== 1) {
+        throw protocolError(
+          `Image stream completed after ${partialEventCount} partial events; expected exactly one.`,
+          "unexpected_event_sequence",
+          classified.eventType,
+        );
+      }
+      lifecycle.clearPhaseTimeout();
+      await onProgress?.("completed_received", { event_type: classified.eventType, event_count: eventCount, bytes_received: byteCount });
       return {
         completed: classified.completed,
         firstByteMs,
         completedPayloadMs: Math.round(performance.now()),
         completedFrameTerminated: frameTerminated,
         partialEventCount,
+        eventCount,
+        lastEventType,
+        byteCount,
       };
     }
     if (classified.kind === "partial") {
-      if (countPartial) partialEventCount += 1;
+      if (partialEventCount !== 0) {
+        throw protocolError("Image stream returned more than one partial event.", "unexpected_event_sequence", classified.eventType);
+      }
+      partialEventCount += 1;
+      lifecycle.armPhaseTimeout(
+        invocation.waitingCompletedTimeoutMs,
+        "waiting_completed_timeout",
+        `Image request timed out waiting for completed after ${invocation.waitingCompletedTimeoutMs}ms.`,
+        "waiting_completed",
+      );
+      await onProgress?.("partial_received", { event_type: classified.eventType, event_count: eventCount, bytes_received: byteCount });
       return null;
-    }
-    if (classified.kind === "unsupported") {
-      throw new Error(`Image stream returned an unsupported event: ${classified.eventType}.`);
     }
     return null;
   };
-
-  const inspectOpenFrame = (extraData = null, rawJson = null) => {
-    const payload = rawJson ?? [...dataLines, ...(extraData === null ? [] : [extraData])].join("\n");
-    if (!payload || payload === "[DONE]") return null;
-    return inspectPayload(payload, false, frameEventType, { countPartial: false });
-  };
-  const processLine = (line) => {
+  const processLine = async (line) => {
     if (line === "") {
-      const payload = dataLines.length > 0 ? dataLines.join("\n") : rawJsonLines.join("\n");
-      const result = inspectPayload(payload, true);
+      if (!frameEventType && dataLines.length === 0) return null;
+      const payload = dataLines.join("\n");
+      const result = await inspectFrame(payload, true);
       dataLines.length = 0;
-      rawJsonLines.length = 0;
       frameEventType = null;
       return result;
     }
@@ -490,17 +505,9 @@ async function consumeImageStream(response, invocation, lifecycle) {
     const data = extractDataPayload(line);
     if (data !== null) {
       dataLines.push(data);
-      // Some proxies transmit a syntactically complete JSON event but never
-      // append the blank SSE frame delimiter. A valid completed payload is
-      // sufficient to persist the final image immediately.
-      return inspectOpenFrame();
+      return null;
     }
-    const trimmed = line.trim();
-    if (trimmed.startsWith("{") || trimmed.startsWith("[") || rawJsonLines.length > 0) {
-      rawJsonLines.push(line);
-      return inspectOpenFrame(null, rawJsonLines.join("\n"));
-    }
-    return null;
+    throw protocolError("Image stream returned an unsupported SSE field.", "invalid_sse_frame", frameEventType);
   };
 
   lifecycle.addAbortListener(() => {
@@ -524,45 +531,25 @@ async function consumeImageStream(response, invocation, lifecycle) {
       while ((newlineIndex = pending.indexOf("\n")) !== -1) {
         const rawLine = pending.slice(0, newlineIndex);
         pending = pending.slice(newlineIndex + 1);
-        const completed = processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+        const completed = await processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
         if (completed) return completed;
       }
-
-      // Also allow a completed `data:` JSON object that ends exactly at a
-      // transport chunk boundary without either an LF or a blank SSE line.
-      // Avoid repeatedly JSON-parsing an incomplete multi-megabyte Base64
-      // payload on every transport chunk. A complete JSON document must end in
-      // a closing object/array delimiter (ignoring whitespace).
-      const pendingTrimmed = pending.trimEnd();
-      const mayBeCompleteJson = pendingTrimmed.endsWith("}") || pendingTrimmed.endsWith("]");
-      let completed = null;
-      if (mayBeCompleteJson) {
-        const pendingData = extractDataPayload(pending);
-        if (pendingData !== null) completed = inspectOpenFrame(pendingData);
-        else if (pending.trimStart().startsWith("{") || pending.trimStart().startsWith("[")) {
-          completed = inspectOpenFrame(null, [...rawJsonLines, pending].join("\n"));
-        }
-      }
-      if (completed) return completed;
     }
 
     pending += decoder.decode();
     if (pending) {
-      const completed = processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
+      const completed = await processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
       if (completed) return completed;
     }
-    const remainingPayload = dataLines.length > 0 ? dataLines.join("\n") : rawJsonLines.join("\n");
-    const completed = inspectPayload(remainingPayload, false);
+    const completed = dataLines.length > 0 || frameEventType
+      ? await inspectFrame(dataLines.join("\n"), false)
+      : null;
     if (completed) return completed;
   } finally {
-    // A completed Base64 payload is terminal. Do not wait for an upstream
-    // proxy to close its SSE socket. Await Undici's local cancellation so no
-    // active stream handle keeps the packaged executable alive after stdout
-    // has the final JSON result.
-    await reader.cancel().catch(() => undefined);
+    await settleWithin(reader.cancel().catch(() => undefined), invocation.cleanupTimeoutMs);
   }
 
-  throw new Error("Image stream ended without an image_generation.completed or image_edit.completed event.");
+  throw protocolError(`Image stream ended before ${EVENT_TYPES_BY_COMMAND[invocation.command].completed}.`, "eof_before_completed");
 }
 
 export async function resolveInvocation(command, cliOptions, { cwd = process.cwd() } = {}) {
@@ -616,6 +603,21 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     // image received before it is always saved and reported, even if that
     // final local write crosses the deadline by a few milliseconds.
     timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: DEFAULT_TIMEOUT_MS }),
+    waitingHeadersTimeoutMs: parseInteger(config.waitingHeadersTimeoutMs, "waitingHeadersTimeoutMs", {
+      min: 1000,
+      max: 600000,
+      fallback: DEFAULT_WAITING_HEADERS_TIMEOUT_MS,
+    }),
+    waitingCompletedTimeoutMs: parseInteger(config.waitingCompletedTimeoutMs, "waitingCompletedTimeoutMs", {
+      min: 1000,
+      max: 600000,
+      fallback: DEFAULT_WAITING_COMPLETED_TIMEOUT_MS,
+    }),
+    cleanupTimeoutMs: parseInteger(config.cleanupTimeoutMs, "cleanupTimeoutMs", {
+      min: 100,
+      max: 10000,
+      fallback: DEFAULT_CLEANUP_TIMEOUT_MS,
+    }),
     overwrite: parseBoolean(merged.overwrite, false),
     mask: parseString(merged.mask, undefined),
     user: parseString(merged.user, undefined),
@@ -688,9 +690,39 @@ function requestIdFromResponse(response) {
   return response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? null;
 }
 
+async function responseBodyPrefix(response, timeoutMs) {
+  if (!response.body) return { body: "", incomplete: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let byteLength = 0;
+  let incomplete = false;
+  const read = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = MAX_ERROR_BODY_BYTES - byteLength;
+      if (remaining <= 0) {
+        incomplete = true;
+        break;
+      }
+      chunks.push(value.subarray(0, remaining));
+      byteLength += Math.min(value.byteLength, remaining);
+      if (value.byteLength > remaining || byteLength >= MAX_ERROR_BODY_BYTES) {
+        incomplete = true;
+        break;
+      }
+    }
+    return true;
+  })();
+  const completed = await settleWithin(read, timeoutMs);
+  if (!completed) incomplete = true;
+  await settleWithin(reader.cancel().catch(() => undefined), DEFAULT_CLEANUP_TIMEOUT_MS);
+  return { body: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"), incomplete };
+}
+
 async function responseError(response, requestId) {
   const contentType = response.headers.get("content-type") ?? "";
-  const body = await response.text();
+  const { body, incomplete } = await responseBodyPrefix(response, ERROR_BODY_TIMEOUT_MS);
   let message;
   if (contentType.includes("json")) {
     try {
@@ -701,7 +733,9 @@ async function responseError(response, requestId) {
     }
   }
   message ??= body.trim().slice(0, 1000) || `Image API returned HTTP ${response.status}.`;
-  return new ImageHttpError(message, { status: response.status, requestId });
+  const error = new ImageHttpError(message, { status: response.status, requestId, code: incomplete ? "http_error_body_incomplete" : "http_error" });
+  error.phase = "http_status";
+  return error;
 }
 
 async function createTransport(proxyUrl) {
@@ -711,15 +745,15 @@ async function createTransport(proxyUrl) {
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : new Agent();
   return {
     dispatcher,
-    async close() {
+    async close(timeoutMs = DEFAULT_CLEANUP_TIMEOUT_MS) {
       // destroy() tears down a streaming or idle keep-alive socket immediately.
       // close() may otherwise wait for the peer EOF after a completed image event.
-      await dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined);
+      return settleWithin(dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined), timeoutMs);
     },
   };
 }
 
-export async function createImageRequest(invocation, { clientRequestId } = {}) {
+export async function createImageRequest(invocation, { clientRequestId, onProgress } = {}) {
   const transport = await createTransport(invocation.proxyUrl);
   let lifecycle;
   try {
@@ -737,6 +771,13 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
     lifecycle = createRequestLifecycle(invocation.timeoutMs);
     lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
+    lifecycle.armPhaseTimeout(
+      Math.min(invocation.timeoutMs, invocation.waitingHeadersTimeoutMs),
+      "waiting_headers_timeout",
+      `Image request timed out waiting for response headers after ${Math.min(invocation.timeoutMs, invocation.waitingHeadersTimeoutMs)}ms.`,
+      "waiting_headers",
+    );
+    await onProgress?.("request_sent", { client_request_id: clientRequestId });
     let response;
     try {
       response = await fetch(`${invocation.baseURL}/images/${invocation.command === "generate" ? "generations" : "edits"}`, {
@@ -759,17 +800,31 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
         phase: "upload_or_delivery_unknown",
       });
     }
+    lifecycle.clearPhaseTimeout();
     const requestId = requestIdFromResponse(response);
+    await onProgress?.("headers_received", { http_status: response.status, api_request_id: requestId });
     if (!response.ok) {
       const error = await responseError(response, requestId);
-      error.phase = "response_incomplete";
       throw error;
     }
+    const responseContentType = response.headers.get("content-type") ?? "";
+    if (!responseContentType.toLowerCase().includes("text/event-stream")) {
+      const error = protocolError(`Image API returned unsupported content type: ${responseContentType || "missing"}.`, "unexpected_content_type");
+      error.request_id = requestId;
+      throw error;
+    }
+    lifecycle.armPhaseTimeout(
+      Math.min(invocation.timeoutMs, invocation.waitingCompletedTimeoutMs),
+      "waiting_completed_timeout",
+      `Image request timed out waiting for completed after ${Math.min(invocation.timeoutMs, invocation.waitingCompletedTimeoutMs)}ms.`,
+      "waiting_completed",
+    );
     let consumed;
     try {
-      consumed = await consumeImageStream(response, invocation, lifecycle);
+      consumed = await consumeImageStream(response, invocation, lifecycle, onProgress);
     } catch (error) {
       error.phase ??= "response_incomplete";
+      error.request_id ??= requestId;
       throw error;
     }
     return {
@@ -780,21 +835,26 @@ export async function createImageRequest(invocation, { clientRequestId } = {}) {
       streamCompletedPayloadMs: Math.max(0, consumed.completedPayloadMs - Math.round(apiStartedAt)),
       streamCompletedFrameTerminated: consumed.completedFrameTerminated,
       streamPartialEventCount: consumed.partialEventCount,
+      streamEventCount: consumed.eventCount,
+      streamLastEventType: consumed.lastEventType,
+      streamBytesReceived: consumed.byteCount,
     };
   } catch (error) {
     try {
-      lifecycle.throwIfAborted();
+      lifecycle?.throwIfAborted();
     } catch (abortError) {
       // Preserve the phase in which cancellation happened. Otherwise an
       // abort while reading a received SSE response looks like a connection
       // failure before upload completed.
-      abortError.phase = error?.phase ?? "upload_or_delivery_unknown";
+      abortError.phase ??= error?.phase ?? "upload_or_delivery_unknown";
       throw abortError;
     }
     throw error;
   } finally {
     lifecycle?.dispose();
-    await transport.close();
+    await onProgress?.("cleanup_started");
+    const cleanupCompleted = await transport.close(invocation.cleanupTimeoutMs);
+    await onProgress?.("cleanup_finished", { cleanup_status: cleanupCompleted ? "completed" : "timed_out" });
   }
 }
 

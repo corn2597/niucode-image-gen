@@ -1,4 +1,4 @@
-122d3d71db62e62e2397a2bacee57f197dbd39ba6a78c014fcd6277a786f11ff  niucodes-image-gen-macos-arm64-v1.7.0.zip
-fe9f77e0831198a6e10be59e4897fd0e4dc11cc028d938bba6184ff06ef4939b  niucodes-image-gen-macos-x64-v1.7.0.zip
-58571557172c45a55c10c21a4b00c38afd9b4c2c1333f3b22a70983a2862ab88  niucodes-image-gen-installer-macos-arm64-v1.7.0.dmg
-f1588d666b0d478043a52f16b51201db7c6a7c6713b7afd93c8490fd09284b44  niucodes-image-gen-installer-macos-x64-v1.7.0.dmg
+0416de1911fc694889bd6c536cd9547e31cf971cdcf20b979994429adcde2e77  niucodes-image-gen-installer-macos-arm64-v1.7.1.dmg
+8e039928874bddfa7dcc7dabe8d8a46ce3415ac24ec3511d3b9c0144327335d4  niucodes-image-gen-installer-macos-x64-v1.7.1.dmg
+63320863923c6c3d34652c7a2977b559c4d198bd234cf24ec8a0ce2e542e75a6  niucodes-image-gen-macos-arm64-v1.7.1.zip
+b0fe33c6d5d00c8035c8cb24c0ff83e591e9ec83ad5b59fc62cc986b59210361  niucodes-image-gen-macos-x64-v1.7.1.zip

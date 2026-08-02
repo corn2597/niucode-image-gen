@@ -58,11 +58,10 @@ async function withMockImagesApi(handler, run) {
 }
 
 function completed(response, command, { close = false } = {}) {
-  const type = command === "generate" ? "image_generation.completed" : "image_edit.completed";
+  const prefix = command === "generate" ? "image_generation" : "image_edit";
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "x-request-id": `mock-${command}` });
-  // Intentionally omit LF/EOF by default: this is the proxy behavior that
-  // used to keep customer requests alive until their full timeout.
-  response.write(`data: ${JSON.stringify({ type, b64_json: fixturePngBase64 })}`);
+  response.write(`event: ${prefix}.partial_image\ndata: ${JSON.stringify({ type: `${prefix}.partial_image`, b64_json: fixturePngBase64, partial_image_index: 0 })}\n\n`);
+  response.write(`event: ${prefix}.completed\ndata: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64, usage: {} })}\n\n`);
   if (close) response.end();
 }
 
@@ -331,67 +330,54 @@ test("completed Base64 returns before upstream SSE EOF and closes the socket", a
   assert.equal(clientClosed, true);
 });
 
-for (const variant of [
-  {
-    name: "SSE event line with a data-only Base64 payload",
-    contentType: "text/event-stream",
-    body: `event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}\n\n`,
-  },
-  {
-    name: "nested relay event envelope",
-    contentType: "text/event-stream",
-    body: `data: ${JSON.stringify({ event: "image_generation.completed", data: { b64_json: fixturePngBase64 } })}\n\n`,
-  },
-  {
-    name: "normal Images JSON response",
-    contentType: "application/json",
-    body: JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }),
-  },
-  {
-    name: "Responses completed envelope with result Base64",
-    contentType: "text/event-stream",
-    body: `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", output: [{ type: "image_generation_call", result: fixturePngBase64 }] })}`,
-  },
-]) {
-  test(`completed image returns promptly for ${variant.name}`, async () => {
-    const root = await tempDir();
-    await withMockImagesApi((_request, response) => {
-      response.writeHead(200, { "content-type": variant.contentType });
-      response.write(variant.body);
-    }, async (baseURL) => {
-      const skillRoot = path.join(root, "skill");
-      await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
-      const started = Date.now();
-      const result = await runWithStdin({
-        version: 2,
-        command: "generate",
-        workspace: path.join(root, "workspace"),
-        prompt: variant.name,
-      }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
-      assert.equal(parseOneJson(result).status, "success");
-      assert.ok(Date.now() - started < 2000, `${variant.name} waited for the open response socket`);
-    });
-  });
-}
-
-test("edit accepts a relay that labels the final image as image_generation.completed", async () => {
+test("edit rejects a generation event instead of adding a cross-protocol branch", async () => {
   const root = await tempDir();
   const source = path.join(root, "source.png");
   await writeFile(source, Buffer.from(fixturePngBase64, "base64"));
   await withMockImagesApi((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.write(`data: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}`);
+    response.end(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
     await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
-    const result = await runWithStdin({
-      version: 2,
-      command: "edit",
-      workspace: path.join(root, "workspace"),
-      prompt: "change one detail",
-      images: [source],
-    }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
-    assert.equal(parseOneJson(result).status, "success");
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "edit", workspace: path.join(root, "workspace"), prompt: "change one detail", images: [source] }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => {
+        const payload = JSON.parse(error.stdout);
+        assert.equal(payload.error.code, "unexpected_event");
+        assert.equal(payload.error.event_type, "image_generation.completed");
+        return true;
+      },
+    );
+  });
+});
+
+test("completed before partial is rejected as an unexpected sequence", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wrong sequence" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => JSON.parse(error.stdout).error.code === "unexpected_event_sequence",
+    );
+  });
+});
+
+test("non-SSE success response is rejected immediately", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    response.end(JSON.stringify({ data: [{ b64_json: fixturePngBase64 }] }));
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "JSON response" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => JSON.parse(error.stdout).error.code === "unexpected_content_type",
+    );
   });
 });
 
@@ -400,8 +386,8 @@ test("partial image does not terminate before the completed image", async () => 
   const partialBase64 = Buffer.from("not the final image").toString("base64");
   await withMockImagesApi((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
-    response.write(`event: image_generation.partial_image\ndata: ${JSON.stringify({ b64_json: partialBase64 })}\n\n`);
-    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}`);
+    response.write(`event: image_generation.partial_image\ndata: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: partialBase64 })}\n\n`);
+    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
     await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
@@ -417,7 +403,7 @@ test("partial image does not terminate before the completed image", async () => 
   });
 });
 
-test("timeout uses the configured full deadline and returns a terminal result", async () => {
+test("waiting completed timeout returns its exact lifecycle phase", async () => {
   const root = await tempDir();
   let clientClosed = false;
   await withMockImagesApi((_request, response) => {
@@ -426,7 +412,7 @@ test("timeout uses the configured full deadline and returns a terminal result", 
     response.once("close", () => { clientClosed = true; });
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
-    await writeConfig(skillRoot, baseURL, { timeoutMs: 1000 });
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000, waitingCompletedTimeoutMs: 1000 });
     let failure;
     try {
       await runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wait for timeout" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
@@ -437,12 +423,72 @@ test("timeout uses the configured full deadline and returns a terminal result", 
     const payload = JSON.parse(failure.stdout);
     assert.equal(payload.status, "timeout");
     assert.equal(payload.exit_code, 124);
-    assert.equal(payload.phase, "response_incomplete");
-    assert.equal(payload.error.code, "timeout");
+    assert.equal(payload.phase, "waiting_completed");
+    assert.equal(payload.error.code, "waiting_completed_timeout");
     assert.equal(payload.retry_safe, false);
-    assert.match(payload.error.message, /timed out after 1000ms/i);
+    assert.match(payload.error.message, /waiting for completed after 1000ms/i);
   });
   assert.equal(clientClosed, true);
+});
+
+test("waiting headers timeout exits before the total deadline", async () => {
+  const root = await tempDir();
+  await withMockImagesApi(() => {}, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000, waitingHeadersTimeoutMs: 1000 });
+    const started = Date.now();
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wait for headers" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => {
+        const payload = JSON.parse(error.stdout);
+        assert.equal(payload.status, "timeout");
+        assert.equal(payload.phase, "waiting_headers");
+        assert.equal(payload.error.code, "waiting_headers_timeout");
+        assert.ok(Date.now() - started < 3000);
+        return true;
+      },
+    );
+  });
+});
+
+test("EOF before completed fails immediately", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.end(`event: image_generation.partial_image\ndata: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: fixturePngBase64 })}\n\n`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "EOF" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => JSON.parse(error.stdout).error.code === "eof_before_completed",
+    );
+  });
+});
+
+test("HTTP error body that stays open is bounded and preserves status", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(502, { "content-type": "application/json" });
+    response.write('{"error":{"message":"upstream unavailable"}}');
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 10000, cleanupTimeoutMs: 500 });
+    const started = Date.now();
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "HTTP error" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => {
+        const payload = JSON.parse(error.stdout);
+        assert.equal(payload.phase, "http_status");
+        assert.equal(payload.api_request_id, null);
+        assert.equal(payload.error.code, "http_error_body_incomplete");
+        assert.match(payload.error.message, /upstream unavailable/);
+        assert.equal(payload.error.status, 502);
+        assert.ok(Date.now() - started < 4000);
+        return true;
+      },
+    );
+  });
 });
 
 test("system temp working directory falls back to configured persistent output", async () => {
@@ -552,6 +598,9 @@ test("installer migrates only the historical 570-second default to ten minutes",
   const config = JSON.parse(await readFile(path.join(installDir, "config.json"), "utf8"));
   assert.equal(config.apiKey, "preserved");
   assert.equal(config.timeoutMs, 600000);
+  assert.equal(config.waitingHeadersTimeoutMs, 300000);
+  assert.equal(config.waitingCompletedTimeoutMs, 120000);
+  assert.equal(config.cleanupTimeoutMs, 2000);
   assert.equal(config.defaultOutputDir, legacyPicturesOutputDirectory({ home: root, platform: process.platform }));
   await assert.rejects(readFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "utf8"));
 });

@@ -6,7 +6,7 @@ on:
       tag:
         description: Release tag
         required: true
-        default: v1.7.0
+        default: v1.7.1
         type: string
 
 permissions:
@@ -122,7 +122,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
-            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --title "${{ inputs.tag }}" --generate-notes
+            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --title "${{ inputs.tag }}" --notes-file RELEASE_NOTES.md
+          else
+            gh release edit "${{ inputs.tag }}" --notes-file RELEASE_NOTES.md
           fi
           gh release upload "${{ inputs.tag }}" release/* --clobber
       - name: Verify GitHub release assets
@@ -138,6 +140,7 @@ jobs:
     needs: assemble
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: niucodes-image-gen-release-assets
@@ -156,7 +159,7 @@ jobs:
               --form "tag_name=$RELEASE_TAG" \
               --form "target_commitish=$GITHUB_SHA" \
               --form "name=$RELEASE_TAG" \
-              --form "body=macOS Intel and Apple Silicon GUI installers" \
+              --form "body=<RELEASE_NOTES.md" \
               --form "prerelease=true" | jq -r '.id')"
           fi
           test -n "$release_id"
@@ -169,7 +172,7 @@ jobs:
             --form "access_token=$GITEE_TOKEN" \
             --form "tag_name=$RELEASE_TAG" \
             --form "name=$RELEASE_TAG" \
-            --form "body=macOS Intel and Apple Silicon GUI installers" \
+            --form "body=<RELEASE_NOTES.md" \
             --form "prerelease=false" >/dev/null
       - name: Verify Gitee release assets
         env:

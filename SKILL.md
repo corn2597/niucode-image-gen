@@ -9,7 +9,7 @@ Run exactly one bundled native executable for each request. Do not use MCP, shel
 
 ## Execution gate
 
-Open the installed `SKILL.md` exactly once as required by Codex. Do not inspect memory, config, the source image, the output directory, or repository files before a normal request. Do not run architecture or credential checks. Use the local command-execution capability available in the current Codex host to launch the installed native executable directly. The executable owns the complete request lifecycle and waits up to its configured timeout. Start exactly one process and wait for that same process to exit before answering.
+Open the installed `SKILL.md` exactly once as required by Codex. Do not inspect memory, config, the source image, the output directory, or repository files before a normal request. Do not run architecture or credential checks. Use the local command-execution capability available in the current Codex host to launch the installed native executable directly. The executable owns the complete request lifecycle, reports phase progress on stderr, and enforces its configured phase and total deadlines. Start exactly one process and wait for that same process to exit before answering.
 
 Use the installed executable from `${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen/bin` on macOS. Select `niucodes-image-gen-macos-arm64` on Apple Silicon or `niucodes-image-gen-macos-x64` on Intel macOS.
 
@@ -21,7 +21,7 @@ Preserve the user prompt verbatim. For generation, invoke `generate --prompt <te
 
 For `edit`, repeat `--image` for multiple absolute input-image paths and optionally add `--mask <absolute-path>`. Multiple input images are supported; the request still produces exactly one output image. Do not set `n` other than `1`.
 
-Output location priority is: explicit absolute `output`; `workspace/image-outputs/niucodes-image-gen`; current task working directory `image-outputs/niucodes-image-gen` when it is not a system temporary directory; configured default output; `~/Pictures/niucodes-image-gen`; then `~/Library/Application Support/niucodes-image-gen/outputs`. Do not create a system temporary output directory or write images inside the skill directory. The native runner validates output writability before the API request. On failure, return its JSON error and do not retry. The configured request timeout is 10 minutes; do not interrupt a request before that deadline.
+Output location priority is: explicit absolute `output`; `workspace/image-outputs/niucodes-image-gen`; current task working directory `image-outputs/niucodes-image-gen` when it is not a system temporary directory; configured default output; `~/Pictures/niucodes-image-gen`; then `~/Library/Application Support/niucodes-image-gen/outputs`. Do not create a system temporary output directory or write images inside the skill directory. The native runner validates output writability before the API request. On failure, return its JSON error and do not retry. Do not impose an external timeout or interrupt a request; the executable owns its waiting-headers, waiting-completed, and 10-minute total deadlines.
 
 Pass arguments directly to the executable. Do not create a shell wrapper and do not translate long options into shell-script parameters. Never start a second process or poll a file. The executable emits one UTF-8 JSON object on stdout and writes operational logs only to stderr.
 
@@ -54,6 +54,6 @@ If that outer `functions.exec` returns `Script running with cell ID ...`, wait f
 
 `run --request-stdin` remains a compatibility entrypoint only when the current command facility can provide one complete UTF-8 JSON object to stdin in the same invocation. Do not require it for normal generation or editing.
 
-The runner saves immediately after a valid `image_generation.completed` or `image_edit.completed` Base64 payload. It does not wait for an SSE delimiter, `[DONE]`, EOF, or proxy connection closure. `config.json` is the only credential source. Never print, inspect, pass, or alter its API key.
+The runner accepts only the observed Images API lifecycle for the selected command: `image_generation.partial_image` then `image_generation.completed`, or `image_edit.partial_image` then `image_edit.completed`. Each SSE `event:` must match the JSON top-level `type`. The runner saves after the completed frame and does not wait for `[DONE]`, EOF, or proxy connection closure. Any other event fails as `unexpected_event`; do not retry it. `config.json` is the only credential source. Never print, inspect, pass, or alter its API key.
 
 After the terminal command exits, parse its single stdout JSON line before answering. Copy `status`, `exit_code`, `timing_ms`, `phase`, `error`, `api_request_id`, and `client_request_id` from that native JSON into the final response. A request timeout is returned as `status: "timeout"`, `exit_code: 124`, and `retry_safe: false`; do not retry it automatically. Put every returned `saved[*].markdown` string on its own line **verbatim** so the image renders. Do not re-read, copy, encode, or re-save the image.

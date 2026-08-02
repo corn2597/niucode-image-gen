@@ -151,6 +151,9 @@ async function ensureOutputConfig(installDir, { home, platform }) {
   if (config.timeoutMs === undefined || Number(config.timeoutMs) === 570000) {
     config.timeoutMs = 600000;
   }
+  config.waitingHeadersTimeoutMs ??= 300000;
+  config.waitingCompletedTimeoutMs ??= 120000;
+  config.cleanupTimeoutMs ??= 2000;
   await mkdir(outputDir, { recursive: true });
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });

@@ -329,6 +329,8 @@ function normalizedError(error, fallbackCode = "runner_failed") {
     code: typeof error?.code === "string" ? error.code : fallbackCode,
     message,
     ...(error?.kind ? { kind: error.kind } : {}),
+    ...(error?.event_type ? { event_type: error.event_type } : {}),
+    ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
     retry_safe: false,
   };
 }
@@ -532,6 +534,17 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
   let requestStarted = false;
   const clientRequestId = randomUUID();
   let phase = "input";
+  const progressStartedAt = performance.now();
+  const emitProgress = async (event, details = {}) => {
+    await writeStderr(`${JSON.stringify({
+      event,
+      command,
+      run_id: runId,
+      client_request_id: clientRequestId,
+      elapsed_ms: Math.round(performance.now() - progressStartedAt),
+      ...details,
+    })}\n`);
+  };
 
   try {
     const verboseResponse = false;
@@ -553,8 +566,12 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       streamCompletedPayloadMs,
       streamCompletedFrameTerminated,
       streamPartialEventCount,
-    } = await createImageRequest(invocation, { clientRequestId });
+      streamEventCount,
+      streamLastEventType,
+      streamBytesReceived,
+    } = await createImageRequest(invocation, { clientRequestId, onProgress: emitProgress });
     phase = "save";
+    await emitProgress("saving", { event_type: streamLastEventType, event_count: streamEventCount, bytes_received: streamBytesReceived });
     const postApiStartedAt = performance.now();
     const saveStartedAt = performance.now();
     const savedItems = await saveImageItems(apiResponse, outputTargets, { overwrite: invocation.overwrite });
@@ -574,6 +591,9 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
         stream_completed_payload: streamCompletedPayloadMs,
         stream_completed_frame_terminated: streamCompletedFrameTerminated,
         stream_partial_events: streamPartialEventCount,
+        stream_events: streamEventCount,
+        stream_last_event_type: streamLastEventType,
+        stream_bytes_received: streamBytesReceived,
         output_prepare: outputPrepareMs,
         decode_save: saveDurationMs,
         save: saveDurationMs,
@@ -592,13 +612,14 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     payload.phase = "complete";
     payload.retry_safe = false;
     payload.timing_ms.local_overhead = payload.timing_ms.non_api;
+    await emitProgress("succeeded", { saved_count: savedItems.length });
 
     return payload;
   } catch (error) {
     const describedError = describeOpenAIError(error);
     const failurePhase = error?.phase
       ?? (requestStarted && isRequestDeliveryUnknown(error) ? "upload_or_delivery_unknown" : phase);
-    const isTimeout = error?.code === "timeout";
+    const isTimeout = ["timeout", "waiting_headers_timeout", "waiting_completed_timeout"].includes(error?.code);
     const failure = lifecyclePayload({
       command: invocation?.command ?? command,
       status: isTimeout ? "timeout" : "failed",

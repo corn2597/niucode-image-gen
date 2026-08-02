@@ -71,17 +71,10 @@ async function withMockImagesApi(handler, run) {
 }
 
 function complete(response, command) {
+  const prefix = command === "generate" ? "image_generation" : "image_edit";
   response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "x-request-id": `packaged-${command}` });
-  // Exercise relay variants seen in production. The stream intentionally has
-  // no trailing newline or EOF, so the native package must return from Base64.
-  if (command === "generate") {
-    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ b64_json: fixturePngBase64 })}`);
-    return;
-  }
-  response.write(`event: image_generation.completed\ndata: ${JSON.stringify({
-    event: "image_generation.completed",
-    data: { b64_json: fixturePngBase64 },
-  })}`);
+  response.write(`event: ${prefix}.partial_image\ndata: ${JSON.stringify({ type: `${prefix}.partial_image`, b64_json: fixturePngBase64, partial_image_index: 0 })}\n\n`);
+  response.write(`event: ${prefix}.completed\ndata: ${JSON.stringify({ type: `${prefix}.completed`, b64_json: fixturePngBase64, usage: {} })}\n\n`);
 }
 
 function readResult(result) {
@@ -139,7 +132,9 @@ await withMockImagesApi((request, response, body) => {
   assert.equal(generate.exit_code, 0);
   assert.equal(generate.api_request_id, "packaged-generate");
   assert.equal((await readFile(generate.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
-  assert.equal(generate.timing_ms.stream_completed_frame_terminated, false);
+  assert.equal(generate.timing_ms.stream_completed_frame_terminated, true);
+  assert.equal(generate.timing_ms.stream_events, 2);
+  assert.equal(generate.timing_ms.stream_last_event_type, "image_generation.completed");
 
   const edit = readResult(await runNative(executable, "edit", [
     "--workspace", path.join(root, "workspace edit 中文"),
@@ -153,7 +148,9 @@ await withMockImagesApi((request, response, body) => {
   assert.equal(edit.exit_code, 0);
   assert.equal(edit.api_request_id, "packaged-edit");
   assert.equal((await readFile(edit.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
-  assert.equal(edit.timing_ms.stream_completed_frame_terminated, false);
+  assert.equal(edit.timing_ms.stream_completed_frame_terminated, true);
+  assert.equal(edit.timing_ms.stream_events, 2);
+  assert.equal(edit.timing_ms.stream_last_event_type, "image_edit.completed");
 });
 
 assert.equal(requestCount, 2, "one API request per native invocation");
