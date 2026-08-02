@@ -126,7 +126,11 @@ jobs:
         run: |
           release_tag="${{ inputs.tag }}"
           if [ -z "$release_tag" ]; then
-            release_tag="v$(cat release-version.txt)"
+            release_tag="$(cat release-version.txt)"
+          fi
+          malformed_tag="v$release_tag"
+          if [ "$malformed_tag" != "$release_tag" ] && gh release view "$malformed_tag" >/dev/null 2>&1; then
+            gh release delete "$malformed_tag" --cleanup-tag --yes
           fi
           if ! gh release view "$release_tag" >/dev/null 2>&1; then
             gh release create "$release_tag" --target "$GITHUB_SHA" --title "$release_tag" --notes-file RELEASE_NOTES.md
@@ -140,7 +144,7 @@ jobs:
         run: |
           release_tag="${{ inputs.tag }}"
           if [ -z "$release_tag" ]; then
-            release_tag="v$(cat release-version.txt)"
+            release_tag="$(cat release-version.txt)"
           fi
           mkdir downloaded
           gh release download "$release_tag" --dir downloaded
@@ -163,7 +167,7 @@ jobs:
           test -n "$GITEE_TOKEN"
           RELEASE_TAG="${{ inputs.tag }}"
           if [ -z "$RELEASE_TAG" ]; then
-            RELEASE_TAG="v$(cat release-version.txt)"
+            RELEASE_TAG="$(cat release-version.txt)"
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
@@ -194,7 +198,7 @@ jobs:
         run: |
           RELEASE_TAG="${{ inputs.tag }}"
           if [ -z "$RELEASE_TAG" ]; then
-            RELEASE_TAG="v$(cat release-version.txt)"
+            RELEASE_TAG="$(cat release-version.txt)"
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" > release.json
