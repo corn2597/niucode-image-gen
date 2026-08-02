@@ -1,6 +1,9 @@
 name: Publish release
 
 on:
+  push:
+    tags:
+      - release-v*
   workflow_dispatch:
     inputs:
       tag:
@@ -121,18 +124,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
-            gh release create "${{ inputs.tag }}" --target "$GITHUB_SHA" --title "${{ inputs.tag }}" --notes-file RELEASE_NOTES.md
-          else
-            gh release edit "${{ inputs.tag }}" --notes-file RELEASE_NOTES.md
+          release_tag="${{ inputs.tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="v$(cat release-version.txt)"
           fi
-          gh release upload "${{ inputs.tag }}" release/* --clobber
+          if ! gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release create "$release_tag" --target "$GITHUB_SHA" --title "$release_tag" --notes-file RELEASE_NOTES.md
+          else
+            gh release edit "$release_tag" --notes-file RELEASE_NOTES.md
+          fi
+          gh release upload "$release_tag" release/* --clobber
       - name: Verify GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_tag="${{ inputs.tag }}"
+          if [ -z "$release_tag" ]; then
+            release_tag="v$(cat release-version.txt)"
+          fi
           mkdir downloaded
-          gh release download "${{ inputs.tag }}" --dir downloaded
+          gh release download "$release_tag" --dir downloaded
           cd downloaded
           sha256sum -c SHA256SUMS.txt
 
@@ -148,9 +159,12 @@ jobs:
       - name: Publish Gitee release
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           test -n "$GITEE_TOKEN"
+          RELEASE_TAG="${{ inputs.tag }}"
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="v$(cat release-version.txt)"
+          fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
           if [ -z "$release_id" ]; then
@@ -177,8 +191,11 @@ jobs:
       - name: Verify Gitee release assets
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          RELEASE_TAG="${{ inputs.tag }}"
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="v$(cat release-version.txt)"
+          fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" > release.json
           for asset in release/*; do
