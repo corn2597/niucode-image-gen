@@ -174,14 +174,22 @@ jobs:
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
+          public_tag="$(curl -fsS "$api/releases/tags/$RELEASE_TAG" | jq -r '.tag_name // empty' || true)"
+          if [ -n "$release_id" ] && [ "$public_tag" != "$RELEASE_TAG" ]; then
+            curl -fsS -X DELETE "$api/releases/$release_id?access_token=$GITEE_TOKEN" >/dev/null
+            release_id=""
+          fi
           if [ -z "$release_id" ]; then
-            release_id="$(curl -fsS -X POST "$api/releases" \
+            create_response="$(curl -fsS -X POST "$api/releases" \
               --form "access_token=$GITEE_TOKEN" \
               --form "tag_name=$RELEASE_TAG" \
               --form "target_commitish=$GITHUB_SHA" \
               --form "name=$RELEASE_TAG" \
               --form "body=<RELEASE_NOTES.md" \
-              --form "prerelease=true" | jq -r '.id')"
+              --form "prerelease=false")"
+            printf '%s' "$create_response" \
+              | jq -e --arg tag "$RELEASE_TAG" '.id and .tag_name == $tag and .prerelease == false' >/dev/null
+            release_id="$(printf '%s' "$create_response" | jq -r '.id // empty')"
           fi
           test -n "$release_id"
           for asset in release/*; do
