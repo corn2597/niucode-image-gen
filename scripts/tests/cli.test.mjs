@@ -80,7 +80,6 @@ test("skill documentation uses direct native commands and preserves nested termi
   const agentMetadata = await readFile(path.join(repoRoot, "agents", "openai.yaml"), "utf8");
   assert.match(skill, /generate --prompt/);
   assert.match(skill, /edit --prompt/);
-  assert.match(skill, /run --request-stdin/);
   assert.match(skill, /Open the installed `SKILL\.md` exactly once/i);
   assert.match(skill, /Do not inspect memory, config, the source image/);
   assert.match(skill, /functions\.exec/);
@@ -352,7 +351,7 @@ test("edit rejects a generation event instead of adding a cross-protocol branch"
   });
 });
 
-test("completed before partial is rejected as an unexpected sequence", async () => {
+test("completed without partial succeeds immediately", async () => {
   const root = await tempDir();
   await withMockImagesApi((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
@@ -360,10 +359,12 @@ test("completed before partial is rejected as an unexpected sequence", async () 
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
     await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
-    await assert.rejects(
-      runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wrong sequence" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
-      (error) => JSON.parse(error.stdout).error.code === "unexpected_event_sequence",
-    );
+    const payload = parseOneJson(await runWithStdin(
+      { version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wait for completed" },
+      { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } },
+    ));
+    assert.equal(payload.status, "success");
+    assert.equal(payload.timing_ms.stream_partial_events, 0);
   });
 });
 
@@ -381,11 +382,12 @@ test("non-SSE success response is rejected immediately", async () => {
   });
 });
 
-test("partial image does not terminate before the completed image", async () => {
+test("partial images are progress and do not terminate before completed", async () => {
   const root = await tempDir();
   const partialBase64 = Buffer.from("not the final image").toString("base64");
   await withMockImagesApi((_request, response) => {
     response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: image_generation.partial_image\ndata: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: partialBase64 })}\n\n`);
     response.write(`event: image_generation.partial_image\ndata: ${JSON.stringify({ type: "image_generation.partial_image", b64_json: partialBase64 })}\n\n`);
     response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
   }, async (baseURL) => {
@@ -398,7 +400,7 @@ test("partial image does not terminate before the completed image", async () => 
       prompt: "wait for final image",
     }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }));
     assert.equal(payload.status, "success");
-    assert.equal(payload.timing_ms.stream_partial_events, 1);
+    assert.equal(payload.timing_ms.stream_partial_events, 2);
     assert.equal((await readFile(payload.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
   });
 });

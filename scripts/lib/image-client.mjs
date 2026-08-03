@@ -453,13 +453,6 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
     eventCount += 1;
     lastEventType = classified.eventType;
     if (classified.kind === "completed") {
-      if (partialEventCount !== 1) {
-        throw protocolError(
-          `Image stream completed after ${partialEventCount} partial events; expected exactly one.`,
-          "unexpected_event_sequence",
-          classified.eventType,
-        );
-      }
       lifecycle.clearPhaseTimeout();
       await onProgress?.("completed_received", { event_type: classified.eventType, event_count: eventCount, bytes_received: byteCount });
       return {
@@ -474,9 +467,6 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
       };
     }
     if (classified.kind === "partial") {
-      if (partialEventCount !== 0) {
-        throw protocolError("Image stream returned more than one partial event.", "unexpected_event_sequence", classified.eventType);
-      }
       partialEventCount += 1;
       lifecycle.armPhaseTimeout(
         invocation.waitingCompletedTimeoutMs,
