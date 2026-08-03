@@ -169,8 +169,8 @@ jobs:
             RELEASE_TAG="$(cat release-version.txt)"
           fi
           if [ -z "$GITEE_TOKEN" ]; then
-            echo "GITEE_TOKEN is not configured; the verification step must find an existing public release."
-            exit 0
+            echo "::error title=Missing Gitee token::GITEE_TOKEN must be configured before publishing a release."
+            exit 1
           fi
           api="https://gitee.com/api/v5/repos/niucodes/niucode-image-gen"
           release_id="$(curl -fsS "$api/releases/tags/$RELEASE_TAG?access_token=$GITEE_TOKEN" | jq -r '.id // empty' || true)"
