@@ -185,16 +185,24 @@ jobs:
           fi
           test -n "$release_id"
           for asset in release/*; do
+            asset_name="$(basename "$asset")"
+            curl -fsS "$api/releases/$release_id/attach_files?access_token=$GITEE_TOKEN&per_page=100" \
+              | jq -r --arg name "$asset_name" '.[] | select(.name == $name) | .id' \
+              | while read -r asset_id; do
+                  curl -fsS -X DELETE \
+                    "$api/releases/$release_id/attach_files/$asset_id?access_token=$GITEE_TOKEN" >/dev/null
+                done
             curl -fsS -X POST "$api/releases/$release_id/attach_files" \
               --form "access_token=$GITEE_TOKEN" \
               --form "file=@$asset" >/dev/null
           done
           curl -fsS -X PATCH "$api/releases/$release_id" \
-            --form "access_token=$GITEE_TOKEN" \
-            --form "tag_name=$RELEASE_TAG" \
-            --form "name=$RELEASE_TAG" \
-            --form "body=<RELEASE_NOTES.md" \
-            --form "prerelease=false" >/dev/null
+            --data-urlencode "access_token=$GITEE_TOKEN" \
+            --data-urlencode "tag_name=$RELEASE_TAG" \
+            --data-urlencode "name=$RELEASE_TAG" \
+            --data-urlencode "body@RELEASE_NOTES.md" \
+            --data-urlencode "prerelease=false" \
+            | jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .prerelease == false' >/dev/null
       - name: Verify Gitee release assets
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -213,3 +221,17 @@ jobs:
           for asset in release/*; do
             jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' release.json >/dev/null
           done
+          for attempt in $(seq 1 12); do
+            curl -fsS "$api/releases/tags/$RELEASE_TAG" > public-release.json
+            curl -fsS "$api/releases/latest" > latest-release.json
+            if jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .prerelease == false' public-release.json >/dev/null \
+              && jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .prerelease == false' latest-release.json >/dev/null; then
+              for asset in release/*; do
+                jq -e --arg name "$(basename "$asset")" '.assets[] | select(.name == $name)' public-release.json >/dev/null
+              done
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Gitee did not expose $RELEASE_TAG as the latest public release." >&2
+          exit 1
