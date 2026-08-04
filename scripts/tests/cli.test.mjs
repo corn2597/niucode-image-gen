@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -24,7 +24,7 @@ async function runWithStdin(request, { env = process.env, cwd = repoRoot, keepSt
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [scriptPath, "run", "--request-stdin"], {
       cwd,
-      env,
+      env: { ...env, NODE_ENV: "test", NIUCODES_IMAGE_GEN_TEST_MODE: "1" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const stdout = [];
@@ -118,7 +118,7 @@ test("direct generate command preserves Chinese spaces and quotes in one structu
       "--workspace", workspace,
       "--quality", "low",
       "--size", "1024x1024",
-    ], { cwd: root, env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    ], { cwd: root, env: { ...process.env, NODE_ENV: "test", NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot, NIUCODES_IMAGE_GEN_TEST_MODE: "1" } });
     const payload = parseOneJson(result);
     assert.equal(payload.status, "success");
     assert.equal(payload.command, "generate");
@@ -149,7 +149,7 @@ test("direct edit command accepts repeated image paths and returns strict JSON",
       "--image", sourceA,
       "--image", sourceB,
       "--workspace", path.join(root, "edit workspace"),
-    ], { cwd: root, env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    ], { cwd: root, env: { ...process.env, NODE_ENV: "test", NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot, NIUCODES_IMAGE_GEN_TEST_MODE: "1" } });
     assert.equal(parseOneJson(result).status, "success");
   });
 });
@@ -189,8 +189,9 @@ test("v2 generate preserves Chinese prompt and returns one strict JSON result", 
     assert.equal(payload.saved.length, 1);
     assert.match(payload.saved[0].absolute_path, /工作区 中文 空格[\\/]image-outputs[\\/]niucodes-image-gen/);
     assert.equal((await readFile(payload.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
-    assert.equal(typeof payload.timing_ms.api, "number");
-    assert.equal(typeof payload.timing_ms.post_complete, "number");
+    assert.equal(typeof payload.timing_ms.http_ms, "number");
+    assert.equal(typeof payload.timing_ms.wrapper_overhead_ms, "number");
+    assert.equal(typeof payload.timing_ms.post_complete_ms, "number");
   });
   assert.equal(requests, 1);
 });
@@ -329,6 +330,43 @@ test("completed Base64 returns before upstream SSE EOF and closes the socket", a
   assert.equal(clientClosed, true);
 });
 
+test("completed JSON returns without an SSE delimiter or upstream EOF", async () => {
+  const root = await tempDir();
+  let clientClosed = false;
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.once("close", () => { clientClosed = true; });
+    response.write("event: image_generation.completed\n");
+    response.write(`data: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    const started = Date.now();
+    const result = await runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "unterminated completed frame" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
+    const payload = parseOneJson(result);
+    assert.equal(payload.status, "success");
+    assert.equal(payload.timing_ms.stream_completed_frame_terminated, false);
+    assert.ok(Date.now() - started < 2000);
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(clientClosed, true);
+});
+
+test("SSE comments and transport metadata do not create business event branches", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(": keepalive\n\nid: 7\nretry: 1000\n");
+    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    const payload = parseOneJson(await runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "transport keepalive" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }));
+    assert.equal(payload.status, "success");
+    assert.equal(payload.timing_ms.stream_events, 1);
+  });
+});
+
 test("edit rejects a generation event instead of adding a cross-protocol branch", async () => {
   const root = await tempDir();
   const source = path.join(root, "source.png");
@@ -405,7 +443,7 @@ test("partial images are progress and do not terminate before completed", async 
   });
 });
 
-test("waiting completed timeout returns its exact lifecycle phase", async () => {
+test("one total timeout covers an open SSE response without completed", async () => {
   const root = await tempDir();
   let clientClosed = false;
   await withMockImagesApi((_request, response) => {
@@ -414,7 +452,7 @@ test("waiting completed timeout returns its exact lifecycle phase", async () => 
     response.once("close", () => { clientClosed = true; });
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
-    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000, waitingCompletedTimeoutMs: 1000 });
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 1000 });
     let failure;
     try {
       await runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wait for timeout" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } });
@@ -425,32 +463,82 @@ test("waiting completed timeout returns its exact lifecycle phase", async () => 
     const payload = JSON.parse(failure.stdout);
     assert.equal(payload.status, "timeout");
     assert.equal(payload.exit_code, 124);
-    assert.equal(payload.phase, "waiting_completed");
-    assert.equal(payload.error.code, "waiting_completed_timeout");
+    assert.equal(payload.phase, "request");
+    assert.equal(payload.error.code, "timeout");
     assert.equal(payload.retry_safe, false);
-    assert.match(payload.error.message, /waiting for completed after 1000ms/i);
+    assert.match(payload.error.message, /timed out after 1000ms/i);
   });
   assert.equal(clientClosed, true);
 });
 
-test("waiting headers timeout exits before the total deadline", async () => {
+test("the same total timeout covers waiting for response headers", async () => {
   const root = await tempDir();
   await withMockImagesApi(() => {}, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
-    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000, waitingHeadersTimeoutMs: 1000 });
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 1000 });
     const started = Date.now();
     await assert.rejects(
       runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "wait for headers" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
       (error) => {
         const payload = JSON.parse(error.stdout);
         assert.equal(payload.status, "timeout");
-        assert.equal(payload.phase, "waiting_headers");
-        assert.equal(payload.error.code, "waiting_headers_timeout");
+        assert.equal(payload.phase, "request");
+        assert.equal(payload.error.code, "timeout");
         assert.ok(Date.now() - started < 3000);
         return true;
       },
     );
   });
+});
+
+test("legacy phase timeout config cannot abort a valid slow completed response", async () => {
+  const root = await tempDir();
+  await withMockImagesApi((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.flushHeaders();
+      setTimeout(() => {
+        response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: fixturePngBase64 })}\n\n`);
+      }, 1100);
+    }, 1100);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, {
+      timeoutMs: 5000,
+      waitingHeadersTimeoutMs: 1000,
+      waitingCompletedTimeoutMs: 1000,
+      cleanupTimeoutMs: 100,
+    });
+    const payload = parseOneJson(await runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "valid slow response" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }));
+    assert.equal(payload.status, "success");
+    assert.ok(payload.timing_ms.http_ms >= 2000);
+  });
+});
+
+test("invalid completed Base64 fails without creating an output file or retry", async () => {
+  const root = await tempDir();
+  let requests = 0;
+  const output = path.join(root, "result.png");
+  await withMockImagesApi((_request, response) => {
+    requests += 1;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(`event: image_generation.completed\ndata: ${JSON.stringify({ type: "image_generation.completed", b64_json: "bm90LWEtcG5n" })}\n\n`);
+  }, async (baseURL) => {
+    const skillRoot = path.join(root, "skill");
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 5000 });
+    await assert.rejects(
+      runWithStdin({ version: 2, command: "generate", prompt: "invalid image", output }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
+      (error) => {
+        const payload = JSON.parse(error.stdout);
+        assert.equal(payload.phase, "save");
+        assert.equal(payload.error.code, "save_failed");
+        assert.equal(payload.retry_safe, false);
+        return true;
+      },
+    );
+  });
+  assert.equal(requests, 1);
+  await assert.rejects(readFile(output));
 });
 
 test("EOF before completed fails immediately", async () => {
@@ -468,14 +556,14 @@ test("EOF before completed fails immediately", async () => {
   });
 });
 
-test("HTTP error body that stays open is bounded and preserves status", async () => {
+test("HTTP error returns immediately and preserves status", async () => {
   const root = await tempDir();
   await withMockImagesApi((_request, response) => {
     response.writeHead(502, { "content-type": "application/json" });
-    response.write('{"error":{"message":"upstream unavailable"}}');
+    response.end('{"error":{"message":"upstream unavailable"}}');
   }, async (baseURL) => {
     const skillRoot = path.join(root, "skill");
-    await writeConfig(skillRoot, baseURL, { timeoutMs: 10000, cleanupTimeoutMs: 500 });
+    await writeConfig(skillRoot, baseURL, { timeoutMs: 10000 });
     const started = Date.now();
     await assert.rejects(
       runWithStdin({ version: 2, command: "generate", workspace: path.join(root, "workspace"), prompt: "HTTP error" }, { env: { ...process.env, NIUCODES_IMAGE_GEN_SKILL_DIR: skillRoot } }),
@@ -483,7 +571,7 @@ test("HTTP error body that stays open is bounded and preserves status", async ()
         const payload = JSON.parse(error.stdout);
         assert.equal(payload.phase, "http_status");
         assert.equal(payload.api_request_id, null);
-        assert.equal(payload.error.code, "http_error_body_incomplete");
+        assert.equal(payload.error.code, "http_error");
         assert.match(payload.error.message, /upstream unavailable/);
         assert.equal(payload.error.status, 502);
         assert.ok(Date.now() - started < 4000);
@@ -572,7 +660,29 @@ test("missing workspace uses Pictures first and persistent application data as a
   );
 });
 
-test("installer migrates only the historical 570-second default to ten minutes", async () => {
+test("production invocation ignores a configurable Base URL", async () => {
+  const root = await tempDir();
+  await writeFile(path.join(root, "config.json"), JSON.stringify({
+    apiKey: "test-key",
+    baseURL: "https://unexpected-provider.example/v1",
+    defaultOutputDir: path.join(path.dirname(root), `${path.basename(root)}-outputs`),
+  }));
+  const previousSkillRoot = process.env.NIUCODES_IMAGE_GEN_SKILL_DIR;
+  const previousTestMode = process.env.NIUCODES_IMAGE_GEN_TEST_MODE;
+  try {
+    process.env.NIUCODES_IMAGE_GEN_SKILL_DIR = root;
+    delete process.env.NIUCODES_IMAGE_GEN_TEST_MODE;
+    const invocation = await resolveInvocation("generate", { prompt: "fixed endpoint", image: [] }, { cwd: root });
+    assert.equal(invocation.baseURL, "https://api-direct.claudecodes.org/v1");
+  } finally {
+    if (previousSkillRoot === undefined) delete process.env.NIUCODES_IMAGE_GEN_SKILL_DIR;
+    else process.env.NIUCODES_IMAGE_GEN_SKILL_DIR = previousSkillRoot;
+    if (previousTestMode === undefined) delete process.env.NIUCODES_IMAGE_GEN_TEST_MODE;
+    else process.env.NIUCODES_IMAGE_GEN_TEST_MODE = previousTestMode;
+  }
+});
+
+test("installer preserves the credential, removes phase deadlines, and fixes local permissions", async () => {
   const root = await tempDir();
   const packageRoot = path.join(root, "native package");
   const installDir = path.join(root, "installed skill");
@@ -588,21 +698,37 @@ test("installer migrates only the historical 570-second default to ten minutes",
   await writeFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "legacy");
   await writeFile(path.join(installDir, "config.json"), JSON.stringify({
     apiKey: "preserved",
+    baseURL: "https://old-provider.example/v1",
     timeoutMs: 570000,
+    waitingHeadersTimeoutMs: 300000,
+    waitingCompletedTimeoutMs: 120000,
+    cleanupTimeoutMs: 2000,
     defaultOutputDir: path.join(root, "Pictures", "niucodes-image-gen"),
   }));
+  const codexConfigPath = path.join(root, "config.toml");
+  const codexConfig = `sandbox_mode = "workspace-write"\napproval_policy = "on-request"\n\n[sandbox_workspace_write]\nnetwork_access = false\nwritable_roots = ["/preserved"]\n\n[mcp_servers.niucodes_image_gen]\ncommand = "obsolete"\n`;
+  await writeFile(codexConfigPath, codexConfig);
   await installSkill({
     packageRoot,
     installDir,
-    configPath: path.join(root, "config.toml"),
+    configPath: codexConfigPath,
     home: root,
   });
   const config = JSON.parse(await readFile(path.join(installDir, "config.json"), "utf8"));
   assert.equal(config.apiKey, "preserved");
   assert.equal(config.timeoutMs, 600000);
-  assert.equal(config.waitingHeadersTimeoutMs, 300000);
-  assert.equal(config.waitingCompletedTimeoutMs, 120000);
-  assert.equal(config.cleanupTimeoutMs, 2000);
+  assert.equal("baseURL" in config, false);
+  assert.equal("waitingHeadersTimeoutMs" in config, false);
+  assert.equal("waitingCompletedTimeoutMs" in config, false);
+  assert.equal("cleanupTimeoutMs" in config, false);
   assert.equal(config.defaultOutputDir, legacyPicturesOutputDirectory({ home: root, platform: process.platform }));
+  assert.equal((await stat(path.join(installDir, "config.json"))).mode & 0o777, 0o600);
+  assert.equal((await stat(selectPlatformBinary({ skillRoot: installDir }))).mode & 0o777, 0o755);
+  const updatedCodexConfig = await readFile(codexConfigPath, "utf8");
+  assert.match(updatedCodexConfig, /sandbox_mode = "workspace-write"/);
+  assert.match(updatedCodexConfig, /approval_policy = "on-request"/);
+  assert.match(updatedCodexConfig, /network_access = false/);
+  assert.match(updatedCodexConfig, /writable_roots = \["\/preserved"\]/);
+  assert.doesNotMatch(updatedCodexConfig, /mcp_servers\.niucodes_image_gen/);
   await assert.rejects(readFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "utf8"));
 });

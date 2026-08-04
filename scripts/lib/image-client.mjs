@@ -10,12 +10,8 @@ export const DEFAULT_BASE_URL = "https://api-direct.claudecodes.org/v1";
 export const DEFAULT_GENERATE_SIZE = "1024x1024";
 export const DEFAULT_EDIT_SIZE = "auto";
 export const DEFAULT_TIMEOUT_MS = 600000;
-export const DEFAULT_WAITING_HEADERS_TIMEOUT_MS = 300000;
-export const DEFAULT_WAITING_COMPLETED_TIMEOUT_MS = 120000;
-export const DEFAULT_CLEANUP_TIMEOUT_MS = 2000;
 const MAX_STREAM_BYTES = 100 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
-const ERROR_BODY_TIMEOUT_MS = 2000;
 const MAX_INPUT_IMAGES = 8;
 const MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024;
@@ -291,7 +287,6 @@ function createRequestLifecycle(timeoutMs) {
   let abortCode = null;
   let abortPhase = null;
   let abortListener = null;
-  let phaseTimeout = null;
 
   const abort = (message, code = "request_cancelled", phase = "cancelled") => {
     if (abortMessage) return;
@@ -301,14 +296,10 @@ function createRequestLifecycle(timeoutMs) {
     controller.abort();
     abortListener?.();
   };
-  const clearPhaseTimeout = () => {
-    clearTimeout(phaseTimeout);
-    phaseTimeout = null;
-  };
   const onSignal = (signalName) => abort(`Image request cancelled by ${signalName}.`, "request_cancelled", "cancelled");
   const onSigint = () => onSignal("SIGINT");
   const onSigterm = () => onSignal("SIGTERM");
-  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`, "timeout", "request_total"), timeoutMs);
+  const timeout = setTimeout(() => abort(`Image request timed out after ${timeoutMs}ms.`, "timeout", "request"), timeoutMs);
 
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
@@ -319,12 +310,6 @@ function createRequestLifecycle(timeoutMs) {
       abortListener = listener;
       if (abortMessage) listener();
     },
-    armPhaseTimeout(timeoutMsForPhase, code, message, phase) {
-      clearPhaseTimeout();
-      const boundedMs = Math.min(timeoutMs, timeoutMsForPhase);
-      phaseTimeout = setTimeout(() => abort(message, code, phase), boundedMs);
-    },
-    clearPhaseTimeout,
     throwIfAborted() {
       if (abortMessage) {
         const error = new Error(abortMessage);
@@ -335,7 +320,6 @@ function createRequestLifecycle(timeoutMs) {
     },
     dispose() {
       clearTimeout(timeout);
-      clearPhaseTimeout();
       process.removeListener("SIGINT", onSigint);
       process.removeListener("SIGTERM", onSigterm);
       abortListener = null;
@@ -419,18 +403,6 @@ function extractDataPayload(line) {
   return line.slice(5).replace(/^ /, "");
 }
 
-async function settleWithin(promise, timeoutMs) {
-  let timer;
-  const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(false), timeoutMs);
-  });
-  try {
-    return await Promise.race([Promise.resolve(promise).then(() => true, () => true), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function consumeImageStream(response, invocation, lifecycle, onProgress) {
   if (!response.body) throw new ImageHttpError("Image API returned an empty response body.", { status: response.status });
 
@@ -453,12 +425,12 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
     eventCount += 1;
     lastEventType = classified.eventType;
     if (classified.kind === "completed") {
-      lifecycle.clearPhaseTimeout();
+      const completedPayloadMs = Math.round(performance.now());
       await onProgress?.("completed_received", { event_type: classified.eventType, event_count: eventCount, bytes_received: byteCount });
       return {
         completed: classified.completed,
         firstByteMs,
-        completedPayloadMs: Math.round(performance.now()),
+        completedPayloadMs,
         completedFrameTerminated: frameTerminated,
         partialEventCount,
         eventCount,
@@ -468,12 +440,6 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
     }
     if (classified.kind === "partial") {
       partialEventCount += 1;
-      lifecycle.armPhaseTimeout(
-        invocation.waitingCompletedTimeoutMs,
-        "waiting_completed_timeout",
-        `Image request timed out waiting for completed after ${invocation.waitingCompletedTimeoutMs}ms.`,
-        "waiting_completed",
-      );
       await onProgress?.("partial_received", { event_type: classified.eventType, event_count: eventCount, bytes_received: byteCount });
       return null;
     }
@@ -497,7 +463,17 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
       dataLines.push(data);
       return null;
     }
+    if (line.startsWith(":")) return null;
+    if (line.startsWith("id:") || line.startsWith("retry:")) return null;
     throw protocolError("Image stream returned an unsupported SSE field.", "invalid_sse_frame", frameEventType);
+  };
+
+  const inspectUnterminatedCompletedLine = async () => {
+    if (frameEventType !== EVENT_TYPES_BY_COMMAND[invocation.command].completed) return null;
+    const payload = extractDataPayload(pending);
+    if (payload === null || parseJsonPayload(payload) === null) return null;
+    pending = "";
+    return inspectFrame(payload, false);
   };
 
   lifecycle.addAbortListener(() => {
@@ -524,6 +500,8 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
         const completed = await processLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
         if (completed) return completed;
       }
+      const unterminatedCompleted = await inspectUnterminatedCompletedLine();
+      if (unterminatedCompleted) return unterminatedCompleted;
     }
 
     pending += decoder.decode();
@@ -536,7 +514,7 @@ async function consumeImageStream(response, invocation, lifecycle, onProgress) {
       : null;
     if (completed) return completed;
   } finally {
-    await settleWithin(reader.cancel().catch(() => undefined), invocation.cleanupTimeoutMs);
+    void reader.cancel().catch(() => undefined);
   }
 
   throw protocolError(`Image stream ended before ${EVENT_TYPES_BY_COMMAND[invocation.command].completed}.`, "eof_before_completed");
@@ -571,7 +549,12 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     command,
     cwd,
     apiKey: parseString(config.apiKey, undefined),
-    baseURL: trimTrailingSlash(parseString(merged.baseURL, DEFAULT_BASE_URL)),
+    // Production always uses the fixed provider. The opt-in test mode is only
+    // for packaged binaries to exercise the full HTTP lifecycle against a
+    // loopback fixture without changing the public protocol.
+    baseURL: process.env.NODE_ENV === "test" && process.env.NIUCODES_IMAGE_GEN_TEST_MODE === "1"
+      ? trimTrailingSlash(parseString(config.baseURL, DEFAULT_BASE_URL))
+      : DEFAULT_BASE_URL,
     // Proxy credentials, if any, remain in config.json and are never accepted
     // from the request file or emitted in a result.
     proxyUrl: parseProxyUrl(config.proxyUrl),
@@ -593,21 +576,6 @@ export async function resolveInvocation(command, cliOptions, { cwd = process.cwd
     // image received before it is always saved and reported, even if that
     // final local write crosses the deadline by a few milliseconds.
     timeoutMs: parseInteger(merged.timeoutMs, "timeoutMs", { min: 1000, max: 600000, fallback: DEFAULT_TIMEOUT_MS }),
-    waitingHeadersTimeoutMs: parseInteger(config.waitingHeadersTimeoutMs, "waitingHeadersTimeoutMs", {
-      min: 1000,
-      max: 600000,
-      fallback: DEFAULT_WAITING_HEADERS_TIMEOUT_MS,
-    }),
-    waitingCompletedTimeoutMs: parseInteger(config.waitingCompletedTimeoutMs, "waitingCompletedTimeoutMs", {
-      min: 1000,
-      max: 600000,
-      fallback: DEFAULT_WAITING_COMPLETED_TIMEOUT_MS,
-    }),
-    cleanupTimeoutMs: parseInteger(config.cleanupTimeoutMs, "cleanupTimeoutMs", {
-      min: 100,
-      max: 10000,
-      fallback: DEFAULT_CLEANUP_TIMEOUT_MS,
-    }),
     overwrite: parseBoolean(merged.overwrite, false),
     mask: parseString(merged.mask, undefined),
     user: parseString(merged.user, undefined),
@@ -680,15 +648,20 @@ function requestIdFromResponse(response) {
   return response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? null;
 }
 
-async function responseBodyPrefix(response, timeoutMs) {
+async function responseBodyPrefix(response, lifecycle) {
   if (!response.body) return { body: "", incomplete: false };
   const reader = response.body.getReader();
   const chunks = [];
   let byteLength = 0;
   let incomplete = false;
-  const read = (async () => {
+  lifecycle.addAbortListener(() => {
+    void reader.cancel().catch(() => undefined);
+  });
+  try {
     for (;;) {
+      lifecycle.throwIfAborted();
       const { done, value } = await reader.read();
+      lifecycle.throwIfAborted();
       if (done) break;
       const remaining = MAX_ERROR_BODY_BYTES - byteLength;
       if (remaining <= 0) {
@@ -702,17 +675,15 @@ async function responseBodyPrefix(response, timeoutMs) {
         break;
       }
     }
-    return true;
-  })();
-  const completed = await settleWithin(read, timeoutMs);
-  if (!completed) incomplete = true;
-  await settleWithin(reader.cancel().catch(() => undefined), DEFAULT_CLEANUP_TIMEOUT_MS);
+  } finally {
+    void reader.cancel().catch(() => undefined);
+  }
   return { body: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"), incomplete };
 }
 
-async function responseError(response, requestId) {
+async function responseError(response, requestId, lifecycle) {
   const contentType = response.headers.get("content-type") ?? "";
-  const { body, incomplete } = await responseBodyPrefix(response, ERROR_BODY_TIMEOUT_MS);
+  const { body, incomplete } = await responseBodyPrefix(response, lifecycle);
   let message;
   if (contentType.includes("json")) {
     try {
@@ -735,10 +706,10 @@ async function createTransport(proxyUrl) {
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : new Agent();
   return {
     dispatcher,
-    async close(timeoutMs = DEFAULT_CLEANUP_TIMEOUT_MS) {
-      // destroy() tears down a streaming or idle keep-alive socket immediately.
-      // close() may otherwise wait for the peer EOF after a completed image event.
-      return settleWithin(dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined), timeoutMs);
+    destroy() {
+      // Start teardown immediately and never keep a completed image waiting on
+      // an upstream EOF or a cleanup deadline.
+      void dispatcher.destroy(new Error("Image stream completed or terminated.")).catch(() => undefined);
     },
   };
 }
@@ -761,12 +732,6 @@ export async function createImageRequest(invocation, { clientRequestId, onProgre
     lifecycle = createRequestLifecycle(invocation.timeoutMs);
     lifecycle.throwIfAborted();
     const apiStartedAt = performance.now();
-    lifecycle.armPhaseTimeout(
-      Math.min(invocation.timeoutMs, invocation.waitingHeadersTimeoutMs),
-      "waiting_headers_timeout",
-      `Image request timed out waiting for response headers after ${Math.min(invocation.timeoutMs, invocation.waitingHeadersTimeoutMs)}ms.`,
-      "waiting_headers",
-    );
     await onProgress?.("request_sent", { client_request_id: clientRequestId });
     let response;
     try {
@@ -790,11 +755,10 @@ export async function createImageRequest(invocation, { clientRequestId, onProgre
         phase: "upload_or_delivery_unknown",
       });
     }
-    lifecycle.clearPhaseTimeout();
     const requestId = requestIdFromResponse(response);
     await onProgress?.("headers_received", { http_status: response.status, api_request_id: requestId });
     if (!response.ok) {
-      const error = await responseError(response, requestId);
+      const error = await responseError(response, requestId, lifecycle);
       throw error;
     }
     const responseContentType = response.headers.get("content-type") ?? "";
@@ -803,12 +767,6 @@ export async function createImageRequest(invocation, { clientRequestId, onProgre
       error.request_id = requestId;
       throw error;
     }
-    lifecycle.armPhaseTimeout(
-      Math.min(invocation.timeoutMs, invocation.waitingCompletedTimeoutMs),
-      "waiting_completed_timeout",
-      `Image request timed out waiting for completed after ${Math.min(invocation.timeoutMs, invocation.waitingCompletedTimeoutMs)}ms.`,
-      "waiting_completed",
-    );
     let consumed;
     try {
       consumed = await consumeImageStream(response, invocation, lifecycle, onProgress);
@@ -820,7 +778,7 @@ export async function createImageRequest(invocation, { clientRequestId, onProgre
     return {
       response: { data: consumed.completed, _request_id: requestId },
       inputPrepareMs,
-      apiDurationMs: Math.round(performance.now() - apiStartedAt),
+      apiDurationMs: Math.max(0, consumed.completedPayloadMs - Math.round(apiStartedAt)),
       streamFirstByteMs: consumed.firstByteMs === null ? null : Math.max(0, consumed.firstByteMs - Math.round(apiStartedAt)),
       streamCompletedPayloadMs: Math.max(0, consumed.completedPayloadMs - Math.round(apiStartedAt)),
       streamCompletedFrameTerminated: consumed.completedFrameTerminated,
@@ -842,9 +800,7 @@ export async function createImageRequest(invocation, { clientRequestId, onProgre
     throw error;
   } finally {
     lifecycle?.dispose();
-    await onProgress?.("cleanup_started");
-    const cleanupCompleted = await transport.close(invocation.cleanupTimeoutMs);
-    await onProgress?.("cleanup_finished", { cleanup_status: cleanupCompleted ? "completed" : "timed_out" });
+    transport.destroy();
   }
 }
 

@@ -7,7 +7,10 @@ Download the DMG for your Mac from the latest Gitee release:
 Open the DMG, launch NiuCodes Image Gen Installer, enter the API Key, and click Install.
 The installer downloads the matching package from the latest Gitee release, verifies
 its SHA-256 checksum, installs it into Codex, and writes config.json. It does not call
-the image API during installation.
+the image API during installation or change Codex sandbox, approval, or network settings.
+
+The installed native executable is mode 0755, config.json is mode 0600, and the
+default output directory is created and checked for writability.
 
 No terminal, Node.js, Python, OpenAI SDK, or administrator permission is required.
 Restart Codex Desktop after installation.

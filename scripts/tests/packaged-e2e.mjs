@@ -55,6 +55,7 @@ async function runNative(executable, command, args) {
   return execFileAsync(executable, [command, ...args], {
     timeout: 15000,
     maxBuffer: 4 * 1024 * 1024,
+    env: { ...process.env, NODE_ENV: "test", NIUCODES_IMAGE_GEN_TEST_MODE: "1" },
   });
 }
 
@@ -132,6 +133,8 @@ await withMockImagesApi((request, response, body) => {
   assert.equal(generate.exit_code, 0);
   assert.equal(generate.api_request_id, "packaged-generate");
   assert.equal((await readFile(generate.saved[0].absolute_path)).toString("base64"), fixturePngBase64);
+  assert.ok(generate.timing_ms.http_ms >= 0);
+  assert.ok(generate.timing_ms.wrapper_overhead_ms >= 0);
   assert.equal(generate.timing_ms.stream_completed_frame_terminated, true);
   assert.equal(generate.timing_ms.stream_events, 2);
   assert.equal(generate.timing_ms.stream_last_event_type, "image_generation.completed");

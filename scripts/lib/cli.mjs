@@ -584,24 +584,21 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
       apiResponse,
       verboseResponse,
       {
-        resolve: resolveDurationMs,
-        input_prepare: inputPrepareMs,
-        api: apiDurationMs,
-        stream_first_byte: streamFirstByteMs,
-        stream_completed_payload: streamCompletedPayloadMs,
+        http_ms: apiDurationMs,
+        save_ms: saveDurationMs,
+        total_ms: totalMs,
+        wrapper_overhead_ms: totalMs - apiDurationMs,
+        time_to_first_byte_ms: streamFirstByteMs,
+        completed_payload_ms: streamCompletedPayloadMs,
         stream_completed_frame_terminated: streamCompletedFrameTerminated,
         stream_partial_events: streamPartialEventCount,
         stream_events: streamEventCount,
         stream_last_event_type: streamLastEventType,
         stream_bytes_received: streamBytesReceived,
-        output_prepare: outputPrepareMs,
-        decode_save: saveDurationMs,
-        save: saveDurationMs,
-        finalize: 0,
-        post_complete: Math.round(performance.now() - postApiStartedAt),
-        post_api: Math.round(performance.now() - postApiStartedAt),
-        non_api: totalMs - apiDurationMs,
-        total: totalMs,
+        input_prepare_ms: inputPrepareMs,
+        output_prepare_ms: outputPrepareMs,
+        config_resolve_ms: resolveDurationMs,
+        post_complete_ms: Math.round(performance.now() - postApiStartedAt),
       },
     );
     payload.version = 2;
@@ -611,7 +608,6 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     payload.stage = "complete";
     payload.phase = "complete";
     payload.retry_safe = false;
-    payload.timing_ms.local_overhead = payload.timing_ms.non_api;
     await emitProgress("succeeded", { saved_count: savedItems.length });
 
     return payload;
@@ -619,7 +615,7 @@ export async function executeImageCommand(command, options, { cwd = process.cwd(
     const describedError = describeOpenAIError(error);
     const failurePhase = error?.phase
       ?? (requestStarted && isRequestDeliveryUnknown(error) ? "upload_or_delivery_unknown" : phase);
-    const isTimeout = ["timeout", "waiting_headers_timeout", "waiting_completed_timeout"].includes(error?.code);
+    const isTimeout = error?.code === "timeout";
     const failure = lifecyclePayload({
       command: invocation?.command ?? command,
       status: isTimeout ? "timeout" : "failed",

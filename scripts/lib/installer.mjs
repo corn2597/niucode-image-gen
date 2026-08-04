@@ -1,11 +1,11 @@
-import { cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import TOML from "@iarna/toml";
 
-import { defaultOutputDirectory, legacyPicturesOutputDirectory, resolveSkillRoot } from "./image-client.mjs";
+import { legacyPicturesOutputDirectory, resolveSkillRoot } from "./image-client.mjs";
 
 const SKILL_NAME = "niucodes-image-gen";
 const LEGACY_SERVER_NAME = "niucodes_image_gen";
@@ -22,23 +22,6 @@ export function defaultInstallDir(home = os.homedir()) {
 
 export function defaultConfigPath(home = os.homedir()) {
   return path.join(home, ".codex", "config.toml");
-}
-
-export function mergeSandboxWritableRoot(configText, writableRoot) {
-  const parsed = TOML.parse(configText || "");
-  const sandbox = parsed.sandbox_workspace_write ?? {};
-  if (!sandbox || typeof sandbox !== "object" || Array.isArray(sandbox)) {
-    throw new Error("[sandbox_workspace_write] must be a TOML table.");
-  }
-  const currentRoots = sandbox.writable_roots ?? [];
-  if (!Array.isArray(currentRoots) || !currentRoots.every((value) => typeof value === "string")) {
-    throw new Error("sandbox_workspace_write.writable_roots must be an array of strings.");
-  }
-  const normalizedRoot = path.resolve(writableRoot);
-  if (currentRoots.some((value) => path.resolve(value) === normalizedRoot)) return configText;
-  sandbox.writable_roots = [...currentRoots, normalizedRoot];
-  parsed.sandbox_workspace_write = sandbox;
-  return TOML.stringify(parsed);
 }
 
 export function removeLegacyMcpServerConfig(configText) {
@@ -151,17 +134,20 @@ async function ensureOutputConfig(installDir, { home, platform }) {
   if (config.timeoutMs === undefined || Number(config.timeoutMs) === 570000) {
     config.timeoutMs = 600000;
   }
-  config.waitingHeadersTimeoutMs ??= 300000;
-  config.waitingCompletedTimeoutMs ??= 120000;
-  config.cleanupTimeoutMs ??= 2000;
+  delete config.baseURL;
+  delete config.waitingHeadersTimeoutMs;
+  delete config.waitingCompletedTimeoutMs;
+  delete config.cleanupTimeoutMs;
   await mkdir(outputDir, { recursive: true });
+  await access(outputDir, fsConstants.W_OK);
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   await rename(temporaryPath, configPath);
+  await chmod(configPath, 0o600);
   return outputDir;
 }
 
-async function updateCodexSandboxConfig(configPath, writableRoot) {
+async function removeLegacyCodexConfig(configPath) {
   let currentConfig = "";
   let existed = false;
   if (await exists(configPath)) {
@@ -169,8 +155,7 @@ async function updateCodexSandboxConfig(configPath, writableRoot) {
     existed = true;
   }
   const withoutLegacy = removeLegacyMcpServerConfig(currentConfig);
-  const updated = mergeSandboxWritableRoot(withoutLegacy, writableRoot);
-  if (updated === currentConfig) return { changed: false, backupPath: null, removedLegacyMcpConfig: false };
+  if (withoutLegacy === currentConfig) return { changed: false, backupPath: null, removedLegacyMcpConfig: false };
 
   await mkdir(path.dirname(configPath), { recursive: true });
   let backupPath = null;
@@ -179,7 +164,7 @@ async function updateCodexSandboxConfig(configPath, writableRoot) {
     await writeFile(backupPath, currentConfig, { mode: 0o600 });
   }
   const temporaryPath = `${configPath}.${process.pid}.tmp`;
-  await writeFile(temporaryPath, updated, { mode: 0o600 });
+  await writeFile(temporaryPath, withoutLegacy, { mode: 0o600 });
   await rename(temporaryPath, configPath);
   return {
     changed: true,
@@ -258,20 +243,17 @@ export async function installSkill({
     throw new Error(`Installed executable was not found: ${executable}`);
   }
   const defaultOutputDir = await ensureOutputConfig(targetRoot, { home, platform });
-  const sandboxConfig = await updateCodexSandboxConfig(path.resolve(configPath), defaultOutputDir);
-  const fallbackSandboxConfig = await updateCodexSandboxConfig(
-    path.resolve(configPath),
-    defaultOutputDirectory({ home, platform }),
-  );
+  await chmod(executable, 0o755);
+  const codexConfig = await removeLegacyCodexConfig(path.resolve(configPath));
   return {
     status: "success",
     skill_dir: targetRoot,
     config_path: path.resolve(configPath),
     executable,
-    protocol: "native-direct-v3-with-stdin-compatibility",
-    removed_legacy_mcp_config: sandboxConfig.removedLegacyMcpConfig,
-    sandbox_config_updated: sandboxConfig.changed || fallbackSandboxConfig.changed,
-    config_backup_path: sandboxConfig.backupPath,
+    protocol: "native-direct-v4-single-deadline",
+    removed_legacy_mcp_config: codexConfig.removedLegacyMcpConfig,
+    codex_config_updated: codexConfig.changed,
+    config_backup_path: codexConfig.backupPath,
     default_output_dir: defaultOutputDir,
     restart_required: true,
   };

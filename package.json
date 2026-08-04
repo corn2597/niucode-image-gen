@@ -1,6 +1,6 @@
 {
   "name": "niucodes-image-gen",
-  "version": "1.7.2",
+  "version": "1.8.0",
   "private": true,
   "description": "Standalone OpenAI Images HTTP wrapper for generation and editing.",
   "type": "module",
@@ -21,7 +21,6 @@
     "assemble:release": "node scripts/assemble-release.mjs"
   },
   "dependencies": {
-    "@iarna/toml": "^3.0.0",
     "undici": "^6.27.0"
   },
   "devDependencies": {
