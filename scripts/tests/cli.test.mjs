@@ -9,7 +9,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { DEFAULT_TIMEOUT_MS, defaultOutputDirectory, legacyPicturesOutputDirectory, resolveInvocation } from "../lib/image-client.mjs";
-import { installSkill, selectPlatformBinary } from "../lib/installer.mjs";
+import { installSkill, installedExecutablePath } from "../lib/installer.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(import.meta.dirname, "..", "..");
@@ -92,6 +92,9 @@ test("skill documentation uses direct native commands and preserves nested termi
   assert.match(skill, /Never call `tools\.exec_command` or `tools\.write_stdin` when those functions are not exposed/);
   assert.match(skill, /client_request_id/);
   assert.match(skill, /Do not create a shell wrapper/i);
+  assert.match(skill, /bin\/niucodes-image-gen`/);
+  assert.match(skill, /Do not detect, infer, or select a CPU architecture/);
+  assert.doesNotMatch(skill, /niucodes-image-gen-macos-(?:arm64|x64)/);
   assert.doesNotMatch(skill, /request-file/i);
   assert.doesNotMatch(skill, /status-file/i);
   assert.match(agentMetadata, /\$niucodes-image-gen/);
@@ -687,7 +690,7 @@ test("installer preserves the credential, removes phase deadlines, and fixes loc
   const packageRoot = path.join(root, "native package");
   const installDir = path.join(root, "installed skill");
   const packageConfig = path.join(packageRoot, "config.json");
-  const packageExecutable = selectPlatformBinary({ skillRoot: packageRoot });
+  const packageExecutable = installedExecutablePath(packageRoot);
   await mkdir(path.dirname(packageExecutable), { recursive: true });
   await writeFile(packageConfig, JSON.stringify({ apiKey: "", timeoutMs: 600000, defaultOutputDir: "" }));
   // npm test intentionally runs before binary packaging in CI. Keep this
@@ -723,7 +726,7 @@ test("installer preserves the credential, removes phase deadlines, and fixes loc
   assert.equal("cleanupTimeoutMs" in config, false);
   assert.equal(config.defaultOutputDir, legacyPicturesOutputDirectory({ home: root, platform: process.platform }));
   assert.equal((await stat(path.join(installDir, "config.json"))).mode & 0o777, 0o600);
-  assert.equal((await stat(selectPlatformBinary({ skillRoot: installDir }))).mode & 0o777, 0o755);
+  assert.equal((await stat(installedExecutablePath(installDir))).mode & 0o777, 0o755);
   const updatedCodexConfig = await readFile(codexConfigPath, "utf8");
   assert.match(updatedCodexConfig, /sandbox_mode = "workspace-write"/);
   assert.match(updatedCodexConfig, /approval_policy = "on-request"/);

@@ -96,7 +96,7 @@ private final class InstallerService: @unchecked Sendable {
         try run("/usr/bin/ditto", ["-x", "-k", archivePath.path, unpackRoot.path])
 
         let packageRoot = unpackRoot.appendingPathComponent("niucodes-image-gen-\(platformID)", isDirectory: true)
-        let executable = packageRoot.appendingPathComponent("bin/niucodes-image-gen-\(platformID)")
+        let executable = packageRoot.appendingPathComponent("bin/niucodes-image-gen")
         let home = fileManager.homeDirectoryForCurrentUser
         let installRoot = home.appendingPathComponent(".codex/skills/niucodes-image-gen", isDirectory: true)
         let codexConfig = home.appendingPathComponent(".codex/config.toml")
@@ -114,7 +114,7 @@ private final class InstallerService: @unchecked Sendable {
         let configData = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys]) + Data("\n".utf8)
         try configData.write(to: installedConfig, options: [.atomic])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: installedConfig.path)
-        try run(installRoot.appendingPathComponent("bin/niucodes-image-gen-\(platformID)").path, ["--help"])
+        try run(installRoot.appendingPathComponent("bin/niucodes-image-gen").path, ["--help"])
     }
 
     private func fetchJSON<T: Decodable>(_ url: URL) throws -> T {

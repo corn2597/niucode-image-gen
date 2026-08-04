@@ -7,6 +7,7 @@ import path from "node:path";
 const root = path.resolve(".");
 const releaseDir = path.join(root, "release");
 const packageName = "niucodes-image-gen";
+const installedBinary = "niucodes-image-gen";
 const metadata = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"));
 const version = metadata.version;
 const argv = process.argv.slice(2);
@@ -35,6 +36,13 @@ async function copyFile(relativePath, destinationRoot) {
   const destination = path.join(destinationRoot, relativePath);
   await mkdir(path.dirname(destination), { recursive: true });
   await cp(path.join(root, relativePath), destination);
+}
+
+async function copyRuntimeBinary(sourceName, destinationRoot) {
+  const destination = path.join(destinationRoot, "bin", installedBinary);
+  await mkdir(path.dirname(destination), { recursive: true });
+  await cp(path.join(root, "bin", sourceName), destination);
+  await chmod(destination, 0o755);
 }
 
 async function zipDirectory(directoryName, archiveName) {
@@ -66,8 +74,7 @@ for (const platform of selectedPlatforms) {
   const directoryName = `${packageName}-${platform.id}`;
   const destination = path.join(releaseDir, directoryName);
   for (const relativePath of sharedFiles) await copyFile(relativePath, destination);
-  await copyFile(path.join("bin", platform.binary), destination);
-  await chmod(path.join(destination, "bin", platform.binary), 0o755);
+  await copyRuntimeBinary(platform.binary, destination);
   const archiveName = `${directoryName}-v${version}.zip`;
   await zipDirectory(directoryName, archiveName);
   archives.push(archiveName);

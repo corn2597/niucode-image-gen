@@ -10,7 +10,9 @@ its SHA-256 checksum, installs it into Codex, and writes config.json. It does no
 the image API during installation or change Codex sandbox, approval, or network settings.
 
 The installed native executable is mode 0755, config.json is mode 0600, and the
-default output directory is created and checked for writability.
+default output directory is created and checked for writability. Both installers
+expose the matching native architecture at the same stable bin/niucodes-image-gen
+path, so Codex never needs to detect or choose a CPU architecture.
 
 No terminal, Node.js, Python, OpenAI SDK, or administrator permission is required.
 Restart Codex Desktop after installation.

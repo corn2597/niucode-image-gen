@@ -43,12 +43,9 @@ async function assertRuntimeOnlyPackage(directory) {
 }
 
 function executableFor(packageRoot) {
-  const files = process.arch === "arm64"
-    ? ["niucodes-image-gen-macos-arm64", "niucodes-image-gen-macos-x64"]
-    : ["niucodes-image-gen-macos-x64", "niucodes-image-gen-macos-arm64"];
   const override = process.env.NIUCODES_IMAGE_GEN_E2E_EXECUTABLE;
   if (override) return path.resolve(override);
-  return path.join(packageRoot, "bin", files[0]);
+  return path.join(packageRoot, "bin", "niucodes-image-gen");
 }
 
 async function runNative(executable, command, args) {

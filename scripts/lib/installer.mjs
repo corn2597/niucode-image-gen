@@ -10,10 +10,8 @@ import { legacyPicturesOutputDirectory, resolveSkillRoot } from "./image-client.
 const SKILL_NAME = "niucodes-image-gen";
 const LEGACY_SERVER_NAME = "niucodes_image_gen";
 
-export function selectPlatformBinary({ platform = process.platform, arch = process.arch, skillRoot } = {}) {
-  if (platform === "darwin" && arch === "arm64") return path.join(skillRoot, "bin", "niucodes-image-gen-macos-arm64");
-  if (platform === "darwin" && arch === "x64") return path.join(skillRoot, "bin", "niucodes-image-gen-macos-x64");
-  throw new Error(`Unsupported platform: ${platform}-${arch}`);
+export function installedExecutablePath(skillRoot) {
+  return path.join(skillRoot, "bin", "niucodes-image-gen");
 }
 
 export function defaultInstallDir(home = os.homedir()) {
@@ -229,7 +227,6 @@ export async function installSkill({
   installDir = defaultInstallDir(),
   configPath = defaultConfigPath(),
   platform = process.platform,
-  arch = process.arch,
   home = os.homedir(),
 } = {}) {
   const sourceRoot = path.resolve(packageRoot);
@@ -238,7 +235,7 @@ export async function installSkill({
     await replaceRuntimePackage(sourceRoot, targetRoot);
   }
   await removeLegacyRunners(targetRoot);
-  const executable = selectPlatformBinary({ platform, arch, skillRoot: targetRoot });
+  const executable = installedExecutablePath(targetRoot);
   if (!(await exists(executable))) {
     throw new Error(`Installed executable was not found: ${executable}`);
   }

@@ -11,7 +11,7 @@ Run exactly one bundled native executable for each request. Do not use MCP, shel
 
 Open the installed `SKILL.md` exactly once as required by Codex. Do not inspect memory, config, the source image, the output directory, or repository files before a normal request. Do not run architecture or credential checks. Use the local command-execution capability available in the current Codex host to launch the installed native executable directly. The executable owns the complete request lifecycle, reports progress on stderr, and enforces one configured total HTTP deadline. Start exactly one process and wait for that same process to exit before answering.
 
-Use the installed executable from `${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen/bin` on macOS. Select `niucodes-image-gen-macos-arm64` on Apple Silicon or `niucodes-image-gen-macos-x64` on Intel macOS.
+Use exactly `${CODEX_HOME:-$HOME/.codex}/skills/niucodes-image-gen/bin/niucodes-image-gen` on macOS. The installer has already placed the correct native architecture at this stable path. Do not detect, infer, or select a CPU architecture.
 
 Preserve the user prompt verbatim. For generation, invoke `generate --prompt <text>`. For editing, invoke `edit --prompt <text>` and repeat `--image <absolute-path>` for every input image. Add `--workspace <absolute-root>` when the current task has a workspace, and add `--output <absolute-path>` only when the user specifies one. Never pass `apiKey`, `config`, `baseUrl`, `stream`, `partialImages`, or a status path.
 

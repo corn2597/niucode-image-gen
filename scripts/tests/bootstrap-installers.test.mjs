@@ -21,6 +21,8 @@ test("macOS GUI installer uses the fixed latest Gitee release and only asks for 
   assert.match(source, /SHA256\.hash/);
   assert.match(source, /SHA-256 校验失败/);
   assert.match(source, /"install"/);
+  assert.match(source, /bin\/niucodes-image-gen"/);
+  assert.doesNotMatch(source, /bin\/niucodes-image-gen-\\\(platformID\\\)/);
   assert.doesNotMatch(source, /images\/(generations|edits)/);
   assert.doesNotMatch(source, /baseURL|model|protocol/);
 });
@@ -35,6 +37,7 @@ test("release scripts contain exactly two macOS packages and two DMG installers"
     assert.match(workflow, new RegExp(platform));
   }
   assert.match(workflow, /installer-\$\{\{ matrix\.id \}\}/);
+  assert.match(createRelease, /installedBinary = "niucodes-image-gen"/);
   for (const contents of [createRelease, assembleRelease, workflow]) {
     assert.doesNotMatch(contents, /win-x64|windows|\.cmd|\.exe/i);
   }
