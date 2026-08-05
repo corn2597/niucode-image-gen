@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { chmod, cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import archiver from "archiver";
 import path from "node:path";
@@ -39,10 +39,17 @@ async function copyFile(relativePath, destinationRoot) {
 }
 
 async function copyRuntimeBinary(sourceName, destinationRoot) {
-  const destination = path.join(destinationRoot, "bin", installedBinary);
-  await mkdir(path.dirname(destination), { recursive: true });
-  await cp(path.join(root, "bin", sourceName), destination);
+  const source = path.join(root, "bin", sourceName);
+  const binDir = path.join(destinationRoot, "bin");
+  await mkdir(binDir, { recursive: true });
+  // New installers and the installed Skill use the stable entrypoint. Keep the
+  // architecture-named symlink only so already-distributed v1.8.0 DMGs can
+  // launch the current package they fetch from Gitee Latest. A relative link
+  // adds no wrapper process and does not duplicate the large native binary.
+  const destination = path.join(binDir, installedBinary);
+  await cp(source, destination);
   await chmod(destination, 0o755);
+  await symlink(installedBinary, path.join(binDir, sourceName));
 }
 
 async function zipDirectory(directoryName, archiveName) {

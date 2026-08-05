@@ -13,6 +13,8 @@ The installed native executable is mode 0755, config.json is mode 0600, and the
 default output directory is created and checked for writability. Both installers
 expose the matching native architecture at the same stable bin/niucodes-image-gen
 path, so Codex never needs to detect or choose a CPU architecture.
+Release ZIPs also include one architecture-named compatibility symlink for
+already-downloaded v1.8.0 DMG installers. It is never copied into the Skill.
 
 No terminal, Node.js, Python, OpenAI SDK, or administrator permission is required.
 Restart Codex Desktop after installation.

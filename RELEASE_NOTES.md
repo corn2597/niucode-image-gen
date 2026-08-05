@@ -1,31 +1,29 @@
-# NiuCodes Image Gen v1.8.1
+# NiuCodes Image Gen v1.8.2
 
-This patch fixes native executable selection on Intel Macs without adding an
-architecture probe, launcher process, API preflight, or retry.
+This patch restores forward compatibility for previously downloaded v1.8.0
+DMG installers while keeping the stable native entrypoint introduced in v1.8.1.
 
 ## Fixed
 
-- Install the architecture selected by the Apple Silicon or Intel GUI installer
-  at one stable `bin/niucodes-image-gen` path.
-- Remove architecture-specific executable names from the installed Skill so
-  Codex cannot infer Apple Silicon on an Intel Mac and launch a missing file.
-- Keep architecture selection deterministic inside the compiled GUI installer:
-  each DMG still downloads and verifies only its matching Gitee Release ZIP.
-- Preserve the v1.8.0 request lifecycle: one native process, one HTTPS request,
-  one user-configurable total timeout, no automatic retry, and immediate return
-  on the matching completed image event.
+- Let v1.8.0 Intel and Apple Silicon DMG installers launch the current package
+  they fetch from the latest formal Gitee Release.
+- Keep `bin/niucodes-image-gen` as the only executable copied into the installed
+  Skill, so Codex still cannot infer or select a CPU architecture.
+- Remove obsolete architecture-named executables during upgrades.
+- Preserve the existing API key, output directory, permission behavior, and
+  single-process/single-request image lifecycle.
 
-## Fixed protocol
+## Compatibility model
 
-- Base URL: `https://api-direct.claudecodes.org/v1`
-- Generation: `POST /images/generations`
-- Editing: `POST /images/edits`
-- `stream: true`, `partial_images: 0`, `n: 1`
+- Current DMGs launch the stable package entrypoint.
+- Release ZIPs include one matching architecture-named symlink solely for
+  v1.8.0 DMGs that dynamically consume Gitee Latest.
+- The symlink runs the same native binary and installs only the stable
+  entrypoint; it does not add a wrapper process or an API request.
 
 ## Verification
 
-- Unit coverage rejects architecture-specific executable names in the Skill.
-- Both release packages contain only the stable executable path while retaining
-  their native Apple Silicon or Intel machine architecture.
-- Packaged generation and multipart editing E2E run through the stable path on
-  both architectures.
+- New-installer and v1.8.0-installer entrypoints both install the same package.
+- Final installed `bin` contains only `niucodes-image-gen`.
+- Packaged generation and multipart editing E2E continue to run through the
+  stable entrypoint on Apple Silicon and Intel.

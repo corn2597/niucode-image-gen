@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdtemp, mkdir, readFile, readdir, readlink, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -40,6 +40,12 @@ async function assertRuntimeOnlyPackage(directory) {
   assert.deepEqual(await findLegacyScripts(directory), [], "Release package must not contain a legacy script runner.");
   assert.equal(await exists(path.join(directory, "scripts")), false, "Release package must not contain source scripts.");
   assert.equal(await exists(path.join(directory, "node_modules")), false, "Release package must not contain Node dependencies.");
+  const binEntries = (await readdir(path.join(directory, "bin"))).sort();
+  const platform = path.basename(directory).replace("niucodes-image-gen-", "");
+  assert.deepEqual(binEntries, ["niucodes-image-gen", `niucodes-image-gen-${platform}`].sort(), "Release package must contain the stable entrypoint and exactly one old-DMG compatibility bootstrap.");
+  const compatibilityBootstrap = path.join(directory, "bin", `niucodes-image-gen-${platform}`);
+  assert.equal((await lstat(compatibilityBootstrap)).isSymbolicLink(), true, "Old-DMG compatibility bootstrap must be a symlink, not a duplicate binary or wrapper.");
+  assert.equal(await readlink(compatibilityBootstrap), "niucodes-image-gen");
 }
 
 function executableFor(packageRoot) {

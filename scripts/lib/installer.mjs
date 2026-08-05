@@ -63,10 +63,11 @@ async function copyRuntimePackage(packageRoot, installDir, existingConfigPath) {
   for (const relativePath of staticFiles) {
     await copyIfPresent(path.join(packageRoot, relativePath), path.join(installDir, relativePath));
   }
-  // Bin contents are fully managed by this package. Replacing the directory
-  // prevents obsolete executables from surviving an upgrade.
+  // Only the stable entrypoint is installed. Release ZIPs also contain one
+  // architecture-named bootstrap for old DMGs, but it must never become a
+  // Skill-visible executable that Codex could select.
   await rm(path.join(installDir, "bin"), { recursive: true, force: true });
-  await copyIfPresent(path.join(packageRoot, "bin"), path.join(installDir, "bin"));
+  await copyIfPresent(installedExecutablePath(packageRoot), installedExecutablePath(installDir));
   const sourceConfig = path.join(packageRoot, "config.json");
   const targetConfig = path.join(installDir, "config.json");
   await copyIfPresent(sourceConfig, targetConfig);
@@ -220,6 +221,10 @@ async function removeLegacyRunners(installDir) {
   // Installed skills are native-only. Remove the entire legacy directory so a
   // previous shell runner cannot survive an in-place upgrade.
   await rm(path.join(installDir, "scripts"), { recursive: true, force: true });
+  await Promise.all([
+    "niucodes-image-gen-macos-arm64",
+    "niucodes-image-gen-macos-x64",
+  ].map((name) => rm(path.join(installDir, "bin", name), { force: true })));
 }
 
 export async function installSkill({

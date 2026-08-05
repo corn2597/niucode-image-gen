@@ -27,7 +27,7 @@ test("macOS GUI installer uses the fixed latest Gitee release and only asks for 
   assert.doesNotMatch(source, /baseURL|model|protocol/);
 });
 
-test("release scripts contain exactly two macOS packages and two DMG installers", async () => {
+test("release scripts keep old DMGs compatible without exposing architecture selection to the Skill", async () => {
   const createRelease = await readFile(path.join(repoRoot, "scripts", "create-release.mjs"), "utf8");
   const assembleRelease = await readFile(path.join(repoRoot, "scripts", "assemble-release.mjs"), "utf8");
   const workflow = await readFile(path.join(repoRoot, ".github", "workflows", "publish-release.yml"), "utf8");
@@ -38,6 +38,8 @@ test("release scripts contain exactly two macOS packages and two DMG installers"
   }
   assert.match(workflow, /installer-\$\{\{ matrix\.id \}\}/);
   assert.match(createRelease, /installedBinary = "niucodes-image-gen"/);
+  assert.match(createRelease, /symlink\(installedBinary, path\.join\(binDir, sourceName\)\)/);
+  assert.match(createRelease, /already-distributed v1\.8\.0 DMGs/);
   for (const contents of [createRelease, assembleRelease, workflow]) {
     assert.doesNotMatch(contents, /win-x64|windows|\.cmd|\.exe/i);
   }

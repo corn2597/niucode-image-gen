@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -696,9 +696,13 @@ test("installer preserves the credential, removes phase deadlines, and fixes loc
   // npm test intentionally runs before binary packaging in CI. Keep this
   // installer unit test self-contained rather than depending on ignored bin/.
   await writeFile(packageExecutable, "test native executable");
+  await writeFile(path.join(packageRoot, "bin", "niucodes-image-gen-macos-arm64"), "compatibility bootstrap");
+  await writeFile(path.join(packageRoot, "bin", "niucodes-image-gen-macos-x64"), "compatibility bootstrap");
   await mkdir(installDir, { recursive: true });
   await mkdir(path.join(installDir, "scripts"), { recursive: true });
   await writeFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "legacy");
+  await mkdir(path.join(installDir, "bin"), { recursive: true });
+  await writeFile(path.join(installDir, "bin", "niucodes-image-gen-macos-x64"), "obsolete architecture entrypoint");
   await writeFile(path.join(installDir, "config.json"), JSON.stringify({
     apiKey: "preserved",
     baseURL: "https://old-provider.example/v1",
@@ -734,4 +738,5 @@ test("installer preserves the credential, removes phase deadlines, and fixes loc
   assert.match(updatedCodexConfig, /writable_roots = \["\/preserved"\]/);
   assert.doesNotMatch(updatedCodexConfig, /mcp_servers\.niucodes_image_gen/);
   await assert.rejects(readFile(path.join(installDir, "scripts", "obsolete-runner.ps1"), "utf8"));
+  assert.deepEqual(await readdir(path.join(installDir, "bin")), ["niucodes-image-gen"]);
 });
